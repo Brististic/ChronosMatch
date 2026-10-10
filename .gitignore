@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.c
+*.html
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.vscode/
+*.mmap
