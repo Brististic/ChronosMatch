@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+# Cython-generated files (rebuilt by: python setup.py build_ext --inplace)
+chronos_engine/*.c
+chronos_engine/*.cpp
+chronos_engine/*.html
