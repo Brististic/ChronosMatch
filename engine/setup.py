@@ -73,9 +73,10 @@ directives = {
 
 setup(
     name="chronos-engine",
-    version="0.1.0",
+    version="0.2.0",
     description="ChronosMatch - Cython limit order book matching engine",
     packages=["chronos_engine"],
+    package_data={"chronos_engine": ["*.pxd"]},   # ship headers so other modules can cimport them
     ext_modules=cythonize(
         extensions,
         compiler_directives=directives,
