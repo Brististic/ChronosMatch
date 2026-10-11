@@ -1,29 +1,37 @@
-import pytest
+import asyncio
+import time
 from src.market_feed import MarketSimulator
 from src.schema import unpack_order
 
 
-@pytest.mark.asyncio
-async def test_market_feed_generation():
-    sim = MarketSimulator(target_rate=100_000)
-    ticks = []
-    async for tick in sim.generate_ticks(count=10):
-        ticks.append(tick)
+def test_market_feed_generation():
+    async def _test():
+        sim = MarketSimulator(target_rate=100_000)
+        ticks = []
+        async for tick in sim.generate_ticks(count=10):
+            ticks.append(tick)
 
-    assert len(ticks) == 10
-    first_order = unpack_order(ticks[0])
-    assert first_order.order_id == 1
-    assert first_order.side in (b"B", b"S")
-    assert first_order.quantity > 0
+        assert len(ticks) == 10
+        first_order = unpack_order(ticks[0])
+        assert first_order.order_id == 1
+        assert first_order.side in (b"B", b"S")
+        assert first_order.quantity > 0
+
+    asyncio.run(_test())
 
 
-if __name__ == "__main__":
-    import asyncio
-
-    async def run_manual():
+def test_market_feed_burst_generation():
+    async def _test():
         sim = MarketSimulator()
-        ticks = [t async for t in sim.generate_ticks(5)]
-        print(f"Generated {len(ticks)} binary ticks successfully.")
-        print(f"Sample tick unpacked: {unpack_order(ticks[0])}")
+        burst = []
+        start_time = time.perf_counter()
 
-    asyncio.run(run_manual())
+        async for tick in sim.generate_burst(burst_size=50):
+            burst.append(tick)
+
+        elapsed = time.perf_counter() - start_time
+        assert len(burst) == 50
+        # Burst of 50 non-delayed ticks must complete in under 50ms
+        assert elapsed < 0.05
+
+    asyncio.run(_test())
