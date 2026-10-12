@@ -5,7 +5,9 @@ ChronosMatch matching engine extension.
 Day 1: build toolchain proof (C++17, nogil).
 Day 2: C structs Order / OrderNode (see order_types.pxd) and the Python-visible
        helpers that let the test-suite inspect them.
-Day 3 adds the price-time priority queues, Day 4 insert and cancel.
+Day 3: price-time priority queue per price level (see price_level.pxd) and
+       the LevelQueue wrapper used to test it from Python.
+Day 4 adds insert and cancel on the full book.
 """
 from libc.stdint cimport uint8_t, uint64_t
 from libc.string cimport memcpy
@@ -13,6 +15,10 @@ from libc.string cimport memcpy
 from chronos_engine.order_types cimport (
     Order, OrderNode, WireOrder, SIDE_BUY, SIDE_SELL,
     side_is_valid, order_from_wire, node_alloc, node_free, node_link,
+)
+from chronos_engine.price_level cimport (
+    PriceLevel, level_init, level_is_empty, level_peek_front, level_push_back,
+    level_remove, level_pop_front, price_better,
 )
 
 cdef extern from *:
@@ -148,3 +154,127 @@ def selftest_linked_nodes(int count=3):
             node_free(node)
             node = nxt
     return (fwd, bwd)
+
+
+# ----------------------------------------------------------------- Day 3 ----
+def is_better_price(bytes side, double a, double b):
+    """Price priority rule: True if price `a` beats `b` for side b'B' or b'S'."""
+    if len(side) != 1 or not side_is_valid(side[0]):
+        raise ValueError("side must be b'B' or b'S'")
+    return bool(price_better(side[0], a, b))
+
+
+cdef class LevelQueue:
+    """
+    Python-visible wrapper around ONE C PriceLevel (FIFO queue of OrderNodes).
+    It exists so the C queue can be tested from Python; the engine itself will
+    call the C functions directly. Remaining nodes are freed on deallocation.
+    """
+    cdef PriceLevel _lvl
+
+    def __cinit__(self, double price):
+        level_init(&self._lvl, price)
+
+    def __dealloc__(self):
+        cdef OrderNode* node = self._lvl.head
+        cdef OrderNode* nxt
+        while node != NULL:
+            nxt = node.next
+            node_free(node)
+            node = nxt
+
+    @property
+    def price(self):
+        return self._lvl.price
+
+    @property
+    def total_quantity(self):
+        return self._lvl.total_quantity
+
+    @property
+    def order_count(self):
+        return self._lvl.order_count
+
+    def __len__(self):
+        return self._lvl.order_count
+
+    def push(self, unsigned long long order_id, unsigned int quantity,
+             unsigned long long timestamp_ns=0, bytes side=b"B"):
+        """Append an order at the tail (lowest time priority)."""
+        cdef OrderNode* node
+        if quantity == 0:
+            raise ValueError("quantity must be > 0")
+        if len(side) != 1 or not side_is_valid(side[0]):
+            raise ValueError("side must be b'B' or b'S'")
+        node = node_alloc()
+        if node == NULL:
+            raise MemoryError()
+        node.order.order_id = order_id
+        node.order.timestamp_ns = timestamp_ns
+        node.order.price = self._lvl.price
+        node.order.quantity = quantity
+        node.order.side = side[0]
+        level_push_back(&self._lvl, node)
+
+    def peek(self):
+        """(order_id, quantity) of the oldest order, or None if empty."""
+        cdef OrderNode* node = level_peek_front(&self._lvl)
+        if node == NULL:
+            return None
+        return (node.order.order_id, node.order.quantity)
+
+    def pop(self):
+        """Remove and return (order_id, quantity) of the oldest order, or None."""
+        cdef OrderNode* node = level_pop_front(&self._lvl)
+        cdef unsigned long long oid
+        cdef unsigned int qty
+        if node == NULL:
+            return None
+        oid = node.order.order_id
+        qty = node.order.quantity
+        node_free(node)
+        return (oid, qty)
+
+    def remove(self, unsigned long long order_id):
+        """Cancel an order by id (linear search: test helper only; Day 4 adds O(1) lookup)."""
+        cdef OrderNode* node = self._lvl.head
+        while node != NULL:
+            if node.order.order_id == order_id:
+                level_remove(&self._lvl, node)
+                node_free(node)
+                return True
+            node = node.next
+        return False
+
+    def orders(self):
+        """All resting orders as [(order_id, quantity), ...] in time priority order."""
+        out = []
+        cdef OrderNode* node = self._lvl.head
+        while node != NULL:
+            out.append((node.order.order_id, node.order.quantity))
+            node = node.next
+        return out
+
+    def check_integrity(self):
+        """Walk forwards and backwards; verify links, count and total quantity."""
+        cdef OrderNode* node = self._lvl.head
+        cdef OrderNode* last = NULL
+        cdef unsigned long long total = 0
+        cdef unsigned long count = 0
+        cdef unsigned long back = 0
+        if node != NULL and node.prev != NULL:
+            return False
+        while node != NULL:
+            if node.next != NULL and node.next.prev != node:
+                return False
+            total += node.order.quantity
+            count += 1
+            last = node
+            node = node.next
+        if last != self._lvl.tail:
+            return False
+        node = self._lvl.tail
+        while node != NULL:
+            back += 1
+            node = node.prev
+        return count == self._lvl.order_count and back == count and total == self._lvl.total_quantity
