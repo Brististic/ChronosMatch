@@ -2,29 +2,44 @@ import curses
 import random
 
 REFRESH_MS = 100  # UI refresh interval
+LEVELS = 5        # price levels shown per side
+TICK = 0.01       # price step between levels
+MAX_QTY = 2000
 
 
-class MockTopOfBook:
-    """Fake best bid/ask feed. Replaced by the real engine output on Day 6."""
+class MockOrderBook:
+    """Fake multi-level book. Replaced by the real engine output on Day 6."""
 
     def __init__(self, mid=150.00):
         self.mid = mid
-        self.bid = mid - 0.01
-        self.ask = mid + 0.01
-        self.bid_qty = 500
-        self.ask_qty = 500
+        self.bids = []  # list of (price, qty), best first
+        self.asks = []  # list of (price, qty), best first
+        self.update()
 
     def update(self):
         self.mid += random.uniform(-0.03, 0.03)
-        half_spread = random.choice([0.01, 0.01, 0.02, 0.03]) / 2
-        self.bid = round(self.mid - half_spread, 2)
-        self.ask = round(self.mid + half_spread, 2)
-        self.bid_qty = random.randint(100, 2000)
-        self.ask_qty = random.randint(100, 2000)
+        best_bid = round(self.mid, 2)
+        best_ask = round(best_bid + random.choice([1, 1, 2, 3]) * TICK, 2)
+        self.bids = [
+            (round(best_bid - i * TICK, 2), random.randint(100, MAX_QTY))
+            for i in range(LEVELS)
+        ]
+        self.asks = [
+            (round(best_ask + i * TICK, 2), random.randint(100, MAX_QTY))
+            for i in range(LEVELS)
+        ]
+
+    @property
+    def best_bid(self):
+        return self.bids[0][0]
+
+    @property
+    def best_ask(self):
+        return self.asks[0][0]
 
     @property
     def spread(self):
-        return round(self.ask - self.bid, 2)
+        return round(self.best_ask - self.best_bid, 2)
 
 
 def put(win, y, x, text, attr=0):
@@ -58,22 +73,46 @@ def draw_panel(win, title):
     put(win, 0, 2, f" {title} ")
 
 
-def draw_book(win, tob):
+def draw_ladder_row(win, row, price, qty, bar_w, attr=0):
+    bar = "#" * int(qty / MAX_QTY * bar_w)
+    put(win, row, 2, f"{price:>10.2f}{qty:>8}  {bar}", attr)
+
+
+def draw_book(win, book):
     draw_panel(win, "Order Book")
-    put(win, 2, 2, f"{'':<10}{'PRICE':>10}{'QTY':>10}", curses.A_BOLD)
-    put(win, 3, 2, f"{'BEST ASK':<10}{tob.ask:>10.2f}{tob.ask_qty:>10}")
-    put(win, 4, 2, f"{'BEST BID':<10}{tob.bid:>10.2f}{tob.bid_qty:>10}")
-    put(win, 6, 2, f"{'SPREAD':<10}{tob.spread:>10.2f}", curses.A_BOLD)
-    put(win, 7, 2, f"{'MID':<10}{(tob.bid + tob.ask) / 2:>10.2f}")
+    h, w = win.getmaxyx()
+
+    # rows needed: header + asks + spread + bids + 2 border rows
+    levels = max(0, min(LEVELS, (h - 4) // 2))
+    bar_w = max(0, w - 24)
+
+    put(win, 1, 2, f"{'PRICE':>10}{'QTY':>8}  DEPTH", curses.A_BOLD)
+
+    # asks: furthest level on top, best ask just above the spread row
+    for i in range(levels):
+        row = 2 + (levels - 1 - i)
+        price, qty = book.asks[i]
+        draw_ladder_row(win, row, price, qty, bar_w, curses.A_DIM)
+
+    # spread row in the middle
+    spread_row = 2 + levels
+    put(win, spread_row, 2, f"-- spread {book.spread:.2f} --", curses.A_BOLD)
+
+    # bids: best bid just below the spread row, then going down
+    for i in range(levels):
+        row = spread_row + 1 + i
+        price, qty = book.bids[i]
+        draw_ladder_row(win, row, price, qty, bar_w)
+
     win.noutrefresh()
 
 
-def draw(wins, tob):
+def draw(wins, book):
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
     wins["header"].noutrefresh()
 
-    draw_book(wins["book"], tob)
+    draw_book(wins["book"], book)
 
     draw_panel(wins["metrics"], "Latency (us)")
     wins["metrics"].noutrefresh()
@@ -93,10 +132,10 @@ def main(stdscr):
     stdscr.timeout(REFRESH_MS)
 
     wins = build_windows(stdscr)
-    tob = MockTopOfBook()
+    book = MockOrderBook()
     while True:
-        tob.update()
-        draw(wins, tob)
+        book.update()
+        draw(wins, book)
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
