@@ -1,47 +1,46 @@
 import os
 import pytest
-from src.schema import pack_order, unpack_order
 from src.ring_buffer import MmapRingBuffer
-
-BUFFER_TEST_FILE = "test_chronos_ring.bin"
 
 
 @pytest.fixture
-def clean_ring_buffer():
-    if os.path.exists(BUFFER_TEST_FILE):
-        os.remove(BUFFER_TEST_FILE)
-    rb = MmapRingBuffer(BUFFER_TEST_FILE, capacity=5, create=True)
-    yield rb
-    rb.close()
-    if os.path.exists(BUFFER_TEST_FILE):
-        os.remove(BUFFER_TEST_FILE)
+def temp_buffer_file(tmp_path):
+    f = tmp_path / "test_ring.bin"
+    return str(f)
 
 
-def test_ring_buffer_write_and_read(clean_ring_buffer):
-    rb = clean_ring_buffer
-    pkt = pack_order(101, b"B", 152.25, 50, 1000)
-
-    assert rb.write(pkt) is True
-
-    retrieved = rb.read()
-    assert retrieved == pkt
-
-    order = unpack_order(retrieved)
-    assert order.order_id == 101
-    assert order.side == b"B"
-    assert order.price == 152.25
-
+def test_basic_write_read(temp_buffer_file):
+    rb = MmapRingBuffer(temp_buffer_file, slot_size=29, capacity=5, create=True)
+    sample_data = b"X" * 29
+    assert rb.write(sample_data) is True
+    assert rb.read() == sample_data
     assert rb.read() is None
+    rb.close()
 
 
-def test_ring_buffer_capacity_overflow(clean_ring_buffer):
-    rb = clean_ring_buffer
-    pkt = pack_order(1, b"S", 150.0, 10, 100)
+def test_batch_write_read_and_drops(temp_buffer_file):
+    rb = MmapRingBuffer(temp_buffer_file, slot_size=29, capacity=10, create=True)
 
-    for _ in range(5):
-        assert rb.write(pkt) is True
+    packets = [bytes([i % 256] * 29) for i in range(8)]
+    written = rb.write_batch(packets)
+    assert written == 8
 
-    assert rb.write(pkt) is False
+    metrics = rb.get_metrics()
+    assert metrics["occupied"] == 8
+    assert metrics["free"] == 1  
+    assert metrics["drops"] == 0
 
-    assert rb.read() is not None
-    assert rb.write(pkt) is True
+    overflow_batch = [bytes([99] * 29) for _ in range(5)]
+    written_extra = rb.write_batch(overflow_batch)
+    assert written_extra == 1
+
+    metrics = rb.get_metrics()
+    assert metrics["drops"] == 4
+    assert metrics["occupied"] == 9
+
+    drained = rb.read_batch(max_count=20)
+    assert len(drained) == 9
+    assert drained[0] == packets[0]
+
+    assert rb.get_metrics()["occupied"] == 0
+    rb.close()
