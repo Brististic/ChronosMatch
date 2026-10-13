@@ -1,10 +1,13 @@
 import curses
 import random
+import time
+from collections import deque
 
-REFRESH_MS = 100  # UI refresh interval
-LEVELS = 5        # price levels shown per side
-TICK = 0.01       # price step between levels
+REFRESH_MS = 100       # UI refresh interval
+LEVELS = 5             # price levels shown per side
+TICK = 0.01            # price step between levels
 MAX_QTY = 2000
+TARGET_OPS = 100_000   # target throughput from the project plan
 
 
 class MockOrderBook:
@@ -40,6 +43,48 @@ class MockOrderBook:
     @property
     def spread(self):
         return round(self.best_ask - self.best_bid, 2)
+
+
+class MockOrderFeed:
+    """Pretends the engine processed orders. Replaced by the real feed on Day 6."""
+
+    def __init__(self):
+        self.last = time.perf_counter()
+
+    def poll(self):
+        """Return how many orders were 'processed' since the last call."""
+        now = time.perf_counter()
+        dt = now - self.last
+        self.last = now
+        rate = TARGET_OPS * random.uniform(0.85, 1.10)
+        return int(rate * dt)
+
+
+class ThroughputMeter:
+    """Orders per second over a rolling time window."""
+
+    def __init__(self, window_s=1.0):
+        self.window_s = window_s
+        self.samples = deque()  # (timestamp, running total)
+        self.total = 0
+        self.peak = 0.0
+
+    def record(self, count):
+        now = time.perf_counter()
+        self.total += count
+        self.samples.append((now, self.total))
+        while len(self.samples) > 1 and now - self.samples[0][0] > self.window_s:
+            self.samples.popleft()
+        self.peak = max(self.peak, self.rate)
+
+    @property
+    def rate(self):
+        if len(self.samples) < 2:
+            return 0.0
+        t0, c0 = self.samples[0]
+        t1, c1 = self.samples[-1]
+        dt = t1 - t0
+        return (c1 - c0) / dt if dt > 0 else 0.0
 
 
 def put(win, y, x, text, attr=0):
@@ -107,15 +152,30 @@ def draw_book(win, book):
     win.noutrefresh()
 
 
-def draw(wins, book):
+def draw_metrics(win, meter):
+    draw_panel(win, "Metrics")
+    h, w = win.getmaxyx()
+
+    put(win, 2, 2, f"{'Orders/sec':<12}{meter.rate:>14,.0f}", curses.A_BOLD)
+    put(win, 3, 2, f"{'Peak':<12}{meter.peak:>14,.0f}")
+    put(win, 4, 2, f"{'Total':<12}{meter.total:>14,}")
+
+    # throughput bar relative to the 100k target
+    bar_w = max(0, w - 6)
+    filled = min(bar_w, int(meter.rate / TARGET_OPS * bar_w))
+    put(win, 6, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]")
+    put(win, 7, 2, f"target {TARGET_OPS:,}/s")
+
+    win.noutrefresh()
+
+
+def draw(wins, book, meter):
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
     wins["header"].noutrefresh()
 
     draw_book(wins["book"], book)
-
-    draw_panel(wins["metrics"], "Latency (us)")
-    wins["metrics"].noutrefresh()
+    draw_metrics(wins["metrics"], meter)
 
     draw_panel(wins["log"], "Trade Log")
     wins["log"].noutrefresh()
@@ -133,9 +193,12 @@ def main(stdscr):
 
     wins = build_windows(stdscr)
     book = MockOrderBook()
+    feed = MockOrderFeed()
+    meter = ThroughputMeter()
     while True:
         book.update()
-        draw(wins, book)
+        meter.record(feed.poll())
+        draw(wins, book, meter)
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
