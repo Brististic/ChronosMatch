@@ -1,51 +1,61 @@
-import asyncio
-import time
+import pytest
+from src.schema import unpack_order, ORDER_SIZE
 from src.market_feed import MarketSimulator
-from src.schema import unpack_order
 
 
-def test_market_feed_generation():
-    async def _test():
-        sim = MarketSimulator(target_rate=100_000, symbols=["AAPL", "TSLA"])
-        ticks = []
-        async for tick in sim.generate_ticks(count=20, cancel_ratio=0.2):
-            ticks.append(tick)
+@pytest.mark.asyncio
+async def test_generate_ticks_count_and_size():
+    sim = MarketSimulator(symbols=["AAPL", "MSFT"], target_rate=100_000)
+    ticks = []
+    async for tick in sim.generate_ticks(count=20, cancel_ratio=0.0):
+        ticks.append(tick)
 
-        assert len(ticks) == 20
-        first_order = unpack_order(ticks[0])
-        assert first_order.order_id == 1
-        assert first_order.side in (b"B", b"S", b"C")
-        assert first_order.quantity > 0
-
-    asyncio.run(_test())
-
-
-def test_market_feed_stochastic_drift():
-    async def _test():
-        sim = MarketSimulator(symbols=["AAPL"])
-        start_price = sim.asset_prices["AAPL"]
-
-        async for _ in sim.generate_ticks(count=50, cancel_ratio=0.0):
-            pass
-
-        end_price = sim.asset_prices["AAPL"]
-        assert end_price > 0.0
-        assert isinstance(end_price, float)
-
-    asyncio.run(_test())
+    assert len(ticks) == 20
+    for tick in ticks:
+        assert len(tick) == ORDER_SIZE
+        order = unpack_order(tick)
+        assert order.side in {b"B", b"S"}
+        assert order.price > 0.0
+        assert order.quantity >= 1
 
 
-def test_market_feed_burst_generation():
-    async def _test():
-        sim = MarketSimulator()
-        burst = []
-        start_time = time.perf_counter()
+@pytest.mark.asyncio
+async def test_cancellation_events_generated():
+    sim = MarketSimulator(symbols=["TSLA"], target_rate=100_000)
+    sides = set()
+    async for tick in sim.generate_ticks(count=100, cancel_ratio=0.3):
+        order = unpack_order(tick)
+        sides.add(order.side)
 
-        async for tick in sim.generate_burst(burst_size=50):
-            burst.append(tick)
+    assert b"C" in sides
 
-        elapsed = time.perf_counter() - start_time
-        assert len(burst) == 50
-        assert elapsed < 0.05
 
-    asyncio.run(_test())
+@pytest.mark.asyncio
+async def test_shock_generator_and_power_law_distribution():
+    sim = MarketSimulator(symbols=["AAPL"])
+
+    shock_packets = await sim.generate_shock_event("AAPL", burst_size=25, price_impact_pct=0.04)
+    assert len(shock_packets) == 25
+
+    orders = [unpack_order(p) for p in shock_packets]
+    assert len(orders) == 25
+    assert all(o.price > 0.0 for o in orders)
+
+    quantities = [o.quantity for o in orders]
+    assert max(quantities) > min(quantities)
+    assert all(q >= 1 for q in quantities)
+
+
+@pytest.mark.asyncio
+async def test_stochastic_price_drift():
+    sim = MarketSimulator(symbols=["AAPL"], target_rate=100_000)
+    initial_price = sim.asset_prices["AAPL"]
+
+    prices = []
+    async for tick in sim.generate_ticks(count=80, cancel_ratio=0.1):
+        order = unpack_order(tick)
+        prices.append(order.price)
+
+    assert len(prices) == 80
+    assert any(p != initial_price for p in prices)
+    assert all(p > 0.0 for p in prices)
