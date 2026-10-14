@@ -9,6 +9,8 @@ TICK = 0.01            # price step between levels
 MAX_QTY = 2000
 TARGET_OPS = 100_000   # target throughput from the project plan
 
+MIN_H, MIN_W = 20, 70  # smallest terminal the layout fits in
+
 
 class MockOrderBook:
     """Fake multi-level book. Replaced by the real engine output on Day 6."""
@@ -88,28 +90,37 @@ class ThroughputMeter:
 
 
 def put(win, y, x, text, attr=0):
-    """addstr that doesn't crash if the window is too small."""
+    """addstr that never crashes or wraps if the window is too small."""
     try:
+        _, w = win.getmaxyx()
+        text = text[: max(0, w - x - 1)]
         win.addstr(y, x, text, attr)
     except curses.error:
         pass
 
 
 def build_windows(stdscr):
+    """Create the sub-windows for the current size, or None if too small."""
     h, w = stdscr.getmaxyx()
+    if h < MIN_H or w < MIN_W:
+        return None
+
     header_h, footer_h = 1, 1
     body_h = h - header_h - footer_h
     top_h = body_h * 6 // 10
     log_h = body_h - top_h
     left_w = w // 2
 
-    return {
-        "header": curses.newwin(header_h, w, 0, 0),
-        "book": curses.newwin(top_h, left_w, header_h, 0),
-        "metrics": curses.newwin(top_h, w - left_w, header_h, left_w),
-        "log": curses.newwin(log_h, w, header_h + top_h, 0),
-        "footer": curses.newwin(footer_h, w, h - 1, 0),
-    }
+    try:
+        return {
+            "header": curses.newwin(header_h, w, 0, 0),
+            "book": curses.newwin(top_h, left_w, header_h, 0),
+            "metrics": curses.newwin(top_h, w - left_w, header_h, left_w),
+            "log": curses.newwin(log_h, w, header_h + top_h, 0),
+            "footer": curses.newwin(footer_h, w, h - 1, 0),
+        }
+    except curses.error:
+        return None
 
 
 def draw_panel(win, title):
@@ -187,24 +198,50 @@ def draw(wins, book, meter):
     curses.doupdate()
 
 
+def draw_too_small(stdscr):
+    """Shown instead of the dashboard when the terminal is below MIN size."""
+    h, w = stdscr.getmaxyx()
+    lines = [f"Terminal too small: {w}x{h}", f"Need at least {MIN_W}x{MIN_H}"]
+    stdscr.erase()
+    for i, text in enumerate(lines):
+        put(stdscr, max(0, h // 2 - 1 + i), max(0, (w - len(text)) // 2), text)
+    stdscr.noutrefresh()
+    curses.doupdate()
+
+
+def handle_resize(stdscr):
+    """Re-read the terminal size, wipe stale content and rebuild the layout."""
+    curses.update_lines_cols()
+    stdscr.clear()
+    stdscr.refresh()  # apply the clear now so getch() doesn't blank the screen later
+    return build_windows(stdscr), stdscr.getmaxyx()
+
+
 def main(stdscr):
     curses.curs_set(0)
     stdscr.timeout(REFRESH_MS)
 
+    size = stdscr.getmaxyx()
     wins = build_windows(stdscr)
     book = MockOrderBook()
     feed = MockOrderFeed()
     meter = ThroughputMeter()
+
     while True:
         book.update()
         meter.record(feed.poll())
-        draw(wins, book, meter)
+
+        if wins is None:
+            draw_too_small(stdscr)
+        else:
+            draw(wins, book, meter)
+
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
-        if key == curses.KEY_RESIZE:
-            stdscr.clear()
-            wins = build_windows(stdscr)
+        # KEY_RESIZE is the normal signal, the size check is a safety net
+        if key == curses.KEY_RESIZE or stdscr.getmaxyx() != size:
+            wins, size = handle_resize(stdscr)
 
 
 if __name__ == "__main__":
