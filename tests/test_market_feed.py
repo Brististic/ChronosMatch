@@ -33,7 +33,6 @@ async def test_cancellation_events_generated():
 @pytest.mark.asyncio
 async def test_shock_generator_and_power_law_distribution():
     sim = MarketSimulator(symbols=["AAPL"])
-
     shock_packets = await sim.generate_shock_event("AAPL", burst_size=25, price_impact_pct=0.04)
     assert len(shock_packets) == 25
 
@@ -59,3 +58,20 @@ async def test_stochastic_price_drift():
     assert len(prices) == 80
     assert any(p != initial_price for p in prices)
     assert all(p > 0.0 for p in prices)
+
+
+def test_l2_depth_ladder_generation():
+    sim = MarketSimulator(symbols=["AAPL"])
+    bids, asks = sim.generate_l2_depth_ladder("AAPL", levels=5, tick_size=0.01)
+
+    assert len(bids) == 5
+    assert len(asks) == 5
+
+    unpacked_bids = [unpack_order(b) for b in bids]
+    unpacked_asks = [unpack_order(a) for a in asks]
+
+    assert unpacked_asks[0].price > unpacked_bids[0].price
+
+    for i in range(len(unpacked_bids) - 1):
+        assert unpacked_bids[i].price > unpacked_bids[i + 1].price
+        assert unpacked_asks[i].price < unpacked_asks[i + 1].price
