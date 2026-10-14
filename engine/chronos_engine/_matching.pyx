@@ -7,8 +7,10 @@ Day 2: C structs Order / OrderNode (see order_types.pxd) and the Python-visible
        helpers that let the test-suite inspect them.
 Day 3: price-time priority queue per price level (see price_level.pxd) and
        the LevelQueue wrapper used to test it from Python.
-Day 4 adds insert and cancel on the full book.
+Day 4: limit order book with insert and cancel (see order_book.pxd) and the
+       OrderBook wrapper used to test it from Python.
 """
+import time
 from libc.stdint cimport uint8_t, uint64_t
 from libc.string cimport memcpy
 
@@ -19,6 +21,12 @@ from chronos_engine.order_types cimport (
 from chronos_engine.price_level cimport (
     PriceLevel, level_init, level_is_empty, level_peek_front, level_push_back,
     level_remove, level_pop_front, price_better,
+)
+from chronos_engine.order_book cimport (
+    Book, BookSide, BOOK_OK, BOOK_ERR_DUPLICATE, BOOK_ERR_INVALID,
+    BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND,
+    book_init, book_destroy, book_insert, book_cancel, book_check,
+    side_best, side_find_level, idmap_find,
 )
 
 cdef extern from *:
@@ -278,3 +286,160 @@ cdef class LevelQueue:
             back += 1
             node = node.prev
         return count == self._lvl.order_count and back == count and total == self._lvl.total_quantity
+
+
+# ----------------------------------------------------------------- Day 4 ----
+cdef inline BookSide* _side_ptr(Book* b, bytes side) except NULL:
+    if len(side) != 1 or not side_is_valid(side[0]):
+        raise ValueError("side must be b'B' or b'S'")
+    return &b.bids if side[0] == SIDE_BUY else &b.asks
+
+
+cdef class OrderBook:
+    """
+    Python-visible wrapper around the C limit order book (insert / cancel / queries).
+    Test scaffolding: the engine itself calls the nogil C functions directly.
+    """
+    cdef Book _book
+
+    def __cinit__(self):
+        if book_init(&self._book) != BOOK_OK:
+            raise MemoryError()
+
+    def __dealloc__(self):
+        book_destroy(&self._book)
+
+    def __len__(self):
+        return self._book.ids.used
+
+    def __contains__(self, unsigned long long order_id):
+        return idmap_find(&self._book.ids, order_id) != NULL
+
+    cdef int _insert(self, Order* order) except -1:
+        cdef int rc = book_insert(&self._book, order)
+        if rc == BOOK_OK:
+            return 0
+        if rc == BOOK_ERR_DUPLICATE:
+            raise ValueError("duplicate order id")
+        if rc == BOOK_ERR_INVALID:
+            raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, 0 < price < 1e15)")
+        raise MemoryError()
+
+    def insert(self, unsigned long long order_id, bytes side, double price,
+               unsigned int quantity, unsigned long long timestamp_ns=0):
+        """Rest a limit order on the book. Raises ValueError on bad input or duplicate id."""
+        cdef Order order
+        if len(side) != 1:
+            raise ValueError("side must be b'B' or b'S'")
+        order.order_id = order_id
+        order.timestamp_ns = timestamp_ns
+        order.price = price
+        order.quantity = quantity
+        order.side = side[0]
+        self._insert(&order)
+
+    def insert_wire(self, const unsigned char[::1] data):
+        """Insert one 29-byte wire message (struct format "=QcdIQ") straight from bytes."""
+        cdef WireOrder wire
+        cdef Order order
+        if data.shape[0] < <Py_ssize_t> sizeof(WireOrder):
+            raise ValueError("buffer shorter than one wire order (29 bytes)")
+        memcpy(&wire, &data[0], sizeof(WireOrder))
+        order_from_wire(&order, &wire)
+        self._insert(&order)
+
+    def cancel(self, unsigned long long order_id):
+        """Cancel a resting order. Returns True if it was on the book, else False."""
+        return book_cancel(&self._book, order_id) == BOOK_OK
+
+    def best_bid(self):
+        """(price, total_quantity) of the best bid level, or None."""
+        cdef PriceLevel* lvl = side_best(&self._book.bids)
+        if lvl == NULL:
+            return None
+        return (lvl.price, lvl.total_quantity)
+
+    def best_ask(self):
+        """(price, total_quantity) of the best ask level, or None."""
+        cdef PriceLevel* lvl = side_best(&self._book.asks)
+        if lvl == NULL:
+            return None
+        return (lvl.price, lvl.total_quantity)
+
+    def spread(self):
+        """best ask - best bid, or None when one side is empty."""
+        cdef PriceLevel* bid = side_best(&self._book.bids)
+        cdef PriceLevel* ask = side_best(&self._book.asks)
+        if bid == NULL or ask == NULL:
+            return None
+        return ask.price - bid.price
+
+    def level_count(self, bytes side):
+        return _side_ptr(&self._book, side).count
+
+    def depth(self, bytes side, unsigned int levels=5):
+        """Top `levels` price levels of a side, best first: [(price, total_qty, order_count)]."""
+        cdef BookSide* s = _side_ptr(&self._book, side)
+        cdef unsigned int i
+        out = []
+        for i in range(s.count):
+            if i >= levels:
+                break
+            out.append((s.levels[i].price, s.levels[i].total_quantity, s.levels[i].order_count))
+        return out
+
+    def level_orders(self, bytes side, double price):
+        """[(order_id, quantity), ...] at one price in time priority order ([] if no level)."""
+        cdef PriceLevel* lvl = side_find_level(_side_ptr(&self._book, side), price)
+        cdef OrderNode* node
+        out = []
+        if lvl == NULL:
+            return out
+        node = lvl.head
+        while node != NULL:
+            out.append((node.order.order_id, node.order.quantity))
+            node = node.next
+        return out
+
+    def check_integrity(self):
+        """Verify sorting, links, totals and the id table against each other."""
+        return bool(book_check(&self._book))
+
+
+def bench_insert_cancel(int n=100000):
+    """
+    Time n inserts then n cancels entirely inside nogil C code.
+    Returns (nanoseconds per insert, nanoseconds per cancel).
+    """
+    cdef Book b
+    cdef Order o
+    cdef int i
+    cdef uint64_t seed = 88172645463325252ULL
+    cdef int rc = 0
+    if book_init(&b) != BOOK_OK:
+        raise MemoryError()
+    t0 = time.perf_counter_ns()
+    with nogil:
+        for i in range(n):
+            seed ^= seed << 13
+            seed ^= seed >> 7
+            seed ^= seed << 17
+            o.order_id = i + 1
+            o.timestamp_ns = i
+            o.quantity = 100
+            if i & 1:
+                o.side = SIDE_BUY
+                o.price = 100.0 - (seed % 200) * 0.01      # bids 98.01 .. 100.00
+            else:
+                o.side = SIDE_SELL
+                o.price = 101.0 + (seed % 200) * 0.01      # asks 101.00 .. 102.99
+            rc |= book_insert(&b, &o)
+    t1 = time.perf_counter_ns()
+    with nogil:
+        for i in range(n):
+            rc |= book_cancel(&b, i + 1)
+    t2 = time.perf_counter_ns()
+    book_destroy(&b)
+    if rc != 0:
+        raise RuntimeError("benchmark operation failed")
+    return ((t1 - t0) / n, (t2 - t1) / n)
