@@ -280,15 +280,21 @@ cdef inline void book_destroy(Book* b) noexcept nogil:
     idmap_free(&b.ids)
 
 
+cdef inline bint order_is_valid(const Order* order) noexcept nogil:
+    # side must be B/S, quantity > 0, 0 < price < 1e15 (this also rejects NaN and inf,
+    # because every comparison with NaN is false)
+    return (side_is_valid(order.side) and order.quantity > 0
+            and order.price > 0.0 and order.price < 1e15)
+
+
 cdef inline int book_insert(Book* b, const Order* order) noexcept nogil:
     # Rest a limit order on the book. Returns a BookStatus code.
     cdef BookSide* s
     cdef PriceLevel* lvl
     cdef OrderNode* node
     cdef int rc
-    if (not side_is_valid(order.side) or order.quantity == 0
-            or not (order.price > 0.0 and order.price < 1e15)):
-        return BOOK_ERR_INVALID                       # also rejects NaN / inf
+    if not order_is_valid(order):
+        return BOOK_ERR_INVALID
     if idmap_find(&b.ids, order.order_id) != NULL:
         return BOOK_ERR_DUPLICATE
     s = &b.bids if order.side == SIDE_BUY else &b.asks

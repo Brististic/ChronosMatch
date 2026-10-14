@@ -9,6 +9,7 @@ Day 3: price-time priority queue per price level (see price_level.pxd) and
        the LevelQueue wrapper used to test it from Python.
 Day 4: limit order book with insert and cancel (see order_book.pxd) and the
        OrderBook wrapper used to test it from Python.
+Day 5: matching of crossing limit orders (see matching.pxd): OrderBook.submit().
 """
 import time
 from libc.stdint cimport uint8_t, uint64_t
@@ -27,6 +28,9 @@ from chronos_engine.order_book cimport (
     BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND,
     book_init, book_destroy, book_insert, book_cancel, book_check,
     side_best, side_find_level, idmap_find,
+)
+from chronos_engine.matching cimport (
+    Fill, FillBuffer, fillbuf_init, fillbuf_free, fillbuf_clear, book_submit,
 )
 
 cdef extern from *:
@@ -338,6 +342,40 @@ cdef class OrderBook:
         order.side = side[0]
         self._insert(&order)
 
+    def submit(self, unsigned long long order_id, bytes side, double price,
+               unsigned int quantity, unsigned long long timestamp_ns=0):
+        """
+        Submit a limit order: trade against crossing orders on the other side
+        (best price first, oldest first, at the resting order's price), then rest
+        any remainder. Returns the fills as [(taker_id, maker_id, price, quantity)].
+        Raises ValueError for invalid input or an id already resting on the book.
+        """
+        cdef Order order
+        cdef FillBuffer fills
+        cdef unsigned int i
+        cdef int rc
+        if len(side) != 1:
+            raise ValueError("side must be b'B' or b'S'")
+        order.order_id = order_id
+        order.timestamp_ns = timestamp_ns
+        order.price = price
+        order.quantity = quantity
+        order.side = side[0]
+        fillbuf_init(&fills)
+        rc = book_submit(&self._book, &order, &fills)
+        out = []
+        for i in range(fills.count):
+            out.append((fills.items[i].taker_id, fills.items[i].maker_id,
+                        fills.items[i].price, fills.items[i].quantity))
+        fillbuf_free(&fills)
+        if rc == BOOK_OK:
+            return out
+        if rc == BOOK_ERR_DUPLICATE:
+            raise ValueError("duplicate order id")
+        if rc == BOOK_ERR_INVALID:
+            raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, 0 < price < 1e15)")
+        raise MemoryError()
+
     def insert_wire(self, const unsigned char[::1] data):
         """Insert one 29-byte wire message (struct format "=QcdIQ") straight from bytes."""
         cdef WireOrder wire
@@ -443,3 +481,41 @@ def bench_insert_cancel(int n=100000):
     if rc != 0:
         raise RuntimeError("benchmark operation failed")
     return ((t1 - t0) / n, (t2 - t1) / n)
+
+
+def bench_match(int n=100000):
+    """
+    Rest n sell orders, then time n buy orders that each trade completely with
+    one of them, entirely inside nogil C code. Returns nanoseconds per matching submit.
+    """
+    cdef Book b
+    cdef FillBuffer fills
+    cdef Order o
+    cdef int i
+    cdef int rc = 0
+    if book_init(&b) != BOOK_OK:
+        raise MemoryError()
+    fillbuf_init(&fills)
+    o.timestamp_ns = 0
+    o.quantity = 10
+    o.side = SIDE_SELL
+    for i in range(n):
+        o.order_id = i + 1
+        o.price = 100.0 + (i % 100) * 0.01
+        rc |= book_insert(&b, &o)
+    o.side = SIDE_BUY
+    o.price = 200.0
+    t0 = time.perf_counter_ns()
+    with nogil:
+        for i in range(n):
+            o.order_id = n + i + 1
+            fillbuf_clear(&fills)
+            rc |= book_submit(&b, &o, &fills)
+            if fills.count != 1:
+                rc |= 1
+    t1 = time.perf_counter_ns()
+    fillbuf_free(&fills)
+    book_destroy(&b)
+    if rc != 0:
+        raise RuntimeError("benchmark operation failed")
+    return (t1 - t0) / n

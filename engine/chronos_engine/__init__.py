@@ -3,6 +3,7 @@ from ._matching import (
     LevelQueue,
     OrderBook,
     bench_insert_cancel,
+    bench_match,
     build_info,
     cpp_standard,
     decode_wire,
@@ -16,6 +17,7 @@ __all__ = [
     "LevelQueue",
     "OrderBook",
     "bench_insert_cancel",
+    "bench_match",
     "build_info",
     "cpp_standard",
     "decode_wire",
@@ -24,4 +26,4 @@ __all__ = [
     "selftest_linked_nodes",
     "selftest_nogil",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
