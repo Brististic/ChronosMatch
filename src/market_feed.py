@@ -128,3 +128,33 @@ class MarketSimulator:
 
         self.asset_prices[shock_symbol] = price
         return packets
+
+    async def generate_flash_crash_sequence(
+        self,
+        symbol: str,
+        steps: int = 100,
+        crash_drop_pct: float = 0.25,
+        panic_cancel_rate: float = 0.60,
+    ) -> List[bytes]:
+        packets = []
+        curr_price = self.asset_prices[symbol]
+        price_decrement = (curr_price * crash_drop_pct) / steps
+        now_ns = time.perf_counter_ns()
+
+        for i in range(steps):
+            self.order_counter += 1
+            # Aggressive dump or panic cancellation
+            if random.random() < panic_cancel_rate and self.active_orders[symbol]:
+                target_id = self.active_orders[symbol].pop(0)
+                pkt = pack_order(target_id, b"C", round(curr_price, 2), 0, now_ns)
+            else:
+                curr_price = max(0.01, curr_price - price_decrement)
+                qty = self._sample_order_quantity(alpha=1.1) * 10  # Panic volumes
+                oid = self.order_counter
+                self.active_orders[symbol].append(oid)
+                pkt = pack_order(oid, b"S", round(curr_price, 2), qty, now_ns)
+
+            packets.append(pkt)
+
+        self.asset_prices[symbol] = round(curr_price, 2)
+        return packets
