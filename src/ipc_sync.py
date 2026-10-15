@@ -1,78 +1,114 @@
 import mmap
 import os
 import struct
+import sys
 import time
+from typing import Optional
 
+# Layout: [lock_flag (uint32), owner_pid (uint32)]
 LOCK_FORMAT = "<II"
-LOCK_SIZE = struct.calcsize(LOCK_FORMAT)  
+LOCK_SIZE = struct.calcsize(LOCK_FORMAT)
 
 
 class MmapProcessLock:
-    """Inter-process spinlock backed by a shared memory-mapped binary flag."""
+    """Inter-process spinlock with PID tracking and stale lock recovery."""
 
-    def __init__(self, filename: str, spin_timeout_sec: float = 2.0, create: bool = True):
-        self.filename = filename
+    def __init__(
+        self,
+        filepath: str,
+        spin_timeout_sec: float = 1.0,
+        stale_timeout_sec: float = 2.0,
+        create: bool = False,
+    ):
+        self.filepath = filepath
         self.spin_timeout_sec = spin_timeout_sec
-        self.file_obj = None
-        self.buf = None
+        self.stale_timeout_sec = stale_timeout_sec
 
         if create:
-            self.file_obj = open(self.filename, "w+b")
-            self.file_obj.seek(LOCK_SIZE - 1)
-            self.file_obj.write(b"\x00")
-            self.file_obj.flush()
-            self.buf = mmap.mmap(self.file_obj.fileno(), LOCK_SIZE)
+            with open(self.filepath, "wb") as f:
+                f.write(b"\x00" * LOCK_SIZE)
+            self._fd = os.open(self.filepath, os.O_RDWR)
+            self._buf = mmap.mmap(self._fd, LOCK_SIZE, access=mmap.ACCESS_WRITE)
             self._write_state(0, 0)
         else:
-            if not os.path.exists(self.filename):
-                raise FileNotFoundError(f"Lock file {self.filename} does not exist.")
-            self.file_obj = open(self.filename, "r+b")
-            self.buf = mmap.mmap(self.file_obj.fileno(), LOCK_SIZE)
+            if not os.path.exists(self.filepath):
+                raise FileNotFoundError(f"Lock file '{self.filepath}' not found.")
+            self._fd = os.open(self.filepath, os.O_RDWR)
+            self._buf = mmap.mmap(self._fd, LOCK_SIZE, access=mmap.ACCESS_WRITE)
 
     def _read_state(self) -> tuple[int, int]:
-        self.buf.seek(0)
-        raw = self.buf.read(LOCK_SIZE)
-        return struct.unpack(LOCK_FORMAT, raw)
+        return struct.unpack_from(LOCK_FORMAT, self._buf, 0)
 
-    def _write_state(self, locked: int, pid: int):
-        self.buf.seek(0)
-        self.buf.write(struct.pack(LOCK_FORMAT, locked, pid))
+    def _write_state(self, flag: int, pid: int) -> None:
+        struct.pack_into(LOCK_FORMAT, self._buf, 0, flag, pid)
 
-    def acquire(self) -> bool:
-        """Acquires lock via spin-wait until acquired or timeout occurs."""
-        my_pid = os.getpid()
-        start = time.perf_counter()
+    def _is_pid_alive(self, pid: int) -> bool:
+        """Cross-platform check if PID is alive without sending termination signals."""
+        if pid <= 0:
+            return False
+        if pid == os.getpid():
+            return True
 
-        while True:
-            locked, pid = self._read_state()
-            if locked == 0:
-                # Claim lock
-                self._write_state(1, my_pid)
-                # Verify ownership (primitive mutual exclusion barrier)
-                chk_locked, chk_pid = self._read_state()
-                if chk_locked == 1 and chk_pid == my_pid:
-                    return True
-
-            if time.perf_counter() - start > self.spin_timeout_sec:
+        if sys.platform == "win32":
+            import ctypes
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle == 0:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        else:
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
                 return False
 
-            time.sleep(0.0001)
+    def acquire(self, timeout_sec: Optional[float] = None) -> bool:
+        timeout = timeout_sec if timeout_sec is not None else self.spin_timeout_sec
+        start = time.perf_counter()
+        my_pid = os.getpid()
 
-    def release(self):
-        """Releases the lock."""
+        while True:
+            flag, owner_pid = self._read_state()
+
+            # Free to take
+            if flag == 0:
+                self._write_state(1, my_pid)
+                f, p = self._read_state()
+                if f == 1 and p == my_pid:
+                    return True
+
+            # If locked by ourselves, don't re-acquire or deadlock
+            elif owner_pid == my_pid:
+                pass
+
+            # Stale lock recovery if holding PID is dead
+            elif not self._is_pid_alive(owner_pid):
+                self._write_state(1, my_pid)
+                f, p = self._read_state()
+                if f == 1 and p == my_pid:
+                    return True
+
+            if (time.perf_counter() - start) >= timeout:
+                return False
+
+            time.sleep(0.0005)
+
+    def release(self) -> None:
         self._write_state(0, 0)
 
     def __enter__(self):
-        acquired = self.acquire()
-        if not acquired:
-            raise TimeoutError(f"Could not acquire IPC process lock within {self.spin_timeout_sec}s")
+        if not self.acquire():
+            raise TimeoutError("Failed to acquire process lock.")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.release()
 
-    def close(self):
-        if self.buf and not self.buf.closed:
-            self.buf.close()
-        if self.file_obj and not self.file_obj.closed:
-            self.file_obj.close()
+    def close(self) -> None:
+        if hasattr(self, "_buf") and self._buf:
+            self._buf.close()
+        if hasattr(self, "_fd") and self._fd:
+            os.close(self._fd)

@@ -135,3 +135,14 @@ class MmapRingBuffer:
             self._buf.close()
         if hasattr(self, "_fd") and self._fd:
             os.close(self._fd)
+
+    def verify_integrity(self) -> bool:
+        """Day 6: Audits buffer pointers and capacity bounds for torn-write detection."""
+        head, tail, cap, size, drops = self._read_header()
+        if cap != self.capacity or size != self.slot_size:
+            return False
+        if head >= cap or tail >= cap:
+            return False
+        if self.total_size != HEADER_SIZE + (cap * size):
+            return False
+        return True
