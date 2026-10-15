@@ -1,19 +1,27 @@
 import curses
 import random
+import struct
 import time
-from collections import deque
+from collections import deque, namedtuple
 
 REFRESH_MS = 100       # UI refresh interval
 LEVELS = 5             # price levels shown per side
 TICK = 0.01            # price step between levels
 MAX_QTY = 2000
 TARGET_OPS = 100_000   # target throughput from the project plan
+FILL_BUFFER = 500      # how many recent fills the UI keeps
 
 MIN_H, MIN_W = 20, 70  # smallest terminal the layout fits in
 
+# Binary layout of one matched fill coming from the engine.
+# PLACEHOLDER: confirm the real layout with the IPC/engine members.
+FILL_STRUCT = struct.Struct("<QBIdQ")  # order_id, side, qty, price, ts_ns
+Fill = namedtuple("Fill", "order_id side qty price ts_ns")
+SIDE_BUY, SIDE_SELL = 0, 1
+
 
 class MockOrderBook:
-    """Fake multi-level book. Replaced by the real engine output on Day 6."""
+    """Fake multi-level book. Lives inside the mock stream below."""
 
     def __init__(self, mid=150.00):
         self.mid = mid
@@ -47,19 +55,59 @@ class MockOrderBook:
         return round(self.best_ask - self.best_bid, 2)
 
 
-class MockOrderFeed:
-    """Pretends the engine processed orders. Replaced by the real feed on Day 6."""
+class MockEngineStream:
+    """Stands in for the engine output until the real one exists.
+
+    Replace this class with the real stream. It only needs:
+      - read() -> (orders_processed: int, fill_bytes: bytes)
+      - book   -> object with .bids, .asks, .best_bid, .best_ask, .spread
+    """
 
     def __init__(self):
+        self.book = MockOrderBook()
         self.last = time.perf_counter()
+        self.next_id = 1
 
-    def poll(self):
-        """Return how many orders were 'processed' since the last call."""
+    def read(self):
         now = time.perf_counter()
         dt = now - self.last
         self.last = now
-        rate = TARGET_OPS * random.uniform(0.85, 1.10)
-        return int(rate * dt)
+
+        self.book.update()
+        n_orders = int(TARGET_OPS * random.uniform(0.85, 1.10) * dt)
+
+        chunks = []
+        for _ in range(min(random.randint(0, 5), n_orders)):
+            side = random.choice((SIDE_BUY, SIDE_SELL))
+            price = self.book.best_ask if side == SIDE_BUY else self.book.best_bid
+            qty = random.randint(10, 500)
+            chunks.append(
+                FILL_STRUCT.pack(self.next_id, side, qty, price, time.time_ns())
+            )
+            self.next_id += 1
+        return n_orders, b"".join(chunks)
+
+
+class EngineReader:
+    """Reads the engine stream, decodes fills and keeps them in a buffer."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.fills = deque(maxlen=FILL_BUFFER)
+        self.fill_total = 0
+
+    @property
+    def book(self):
+        return self.stream.book
+
+    def poll(self):
+        """Pull new data. Returns how many orders the engine processed."""
+        n_orders, raw = self.stream.read()
+        size = FILL_STRUCT.size
+        for off in range(0, len(raw) - size + 1, size):
+            self.fills.append(Fill(*FILL_STRUCT.unpack_from(raw, off)))
+            self.fill_total += 1
+        return n_orders
 
 
 class ThroughputMeter:
@@ -180,16 +228,29 @@ def draw_metrics(win, meter):
     win.noutrefresh()
 
 
-def draw(wins, book, meter):
+def draw_log(win, reader):
+    draw_panel(win, "Trade Log")
+    h, _ = win.getmaxyx()
+
+    put(win, 1, 2, f"fills ingested: {reader.fill_total:,}", curses.A_BOLD)
+
+    rows = max(0, h - 3)
+    recent = list(reader.fills)[-rows:] if rows else []
+    for i, f in enumerate(recent):
+        side = "BUY " if f.side == SIDE_BUY else "SELL"
+        put(win, 2 + i, 2, f"#{f.order_id:<9} {side} {f.qty:>5} @ {f.price:>9.2f}")
+
+    win.noutrefresh()
+
+
+def draw(wins, reader, meter):
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
     wins["header"].noutrefresh()
 
-    draw_book(wins["book"], book)
+    draw_book(wins["book"], reader.book)
     draw_metrics(wins["metrics"], meter)
-
-    draw_panel(wins["log"], "Trade Log")
-    wins["log"].noutrefresh()
+    draw_log(wins["log"], reader)
 
     wins["footer"].erase()
     put(wins["footer"], 0, 1, "q: quit")
@@ -223,18 +284,16 @@ def main(stdscr):
 
     size = stdscr.getmaxyx()
     wins = build_windows(stdscr)
-    book = MockOrderBook()
-    feed = MockOrderFeed()
+    reader = EngineReader(MockEngineStream())  # swap in the real stream later
     meter = ThroughputMeter()
 
     while True:
-        book.update()
-        meter.record(feed.poll())
+        meter.record(reader.poll())
 
         if wins is None:
             draw_too_small(stdscr)
         else:
-            draw(wins, book, meter)
+            draw(wins, reader, meter)
 
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
