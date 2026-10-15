@@ -7,6 +7,7 @@ from ._matching import (
     build_info,
     cpp_standard,
     decode_wire,
+    gil_check_demo,
     is_better_price,
     layout_info,
     selftest_linked_nodes,
@@ -21,9 +22,10 @@ __all__ = [
     "build_info",
     "cpp_standard",
     "decode_wire",
+    "gil_check_demo",
     "is_better_price",
     "layout_info",
     "selftest_linked_nodes",
     "selftest_nogil",
 ]
-__version__ = "0.5.0"
+__version__ = "0.6.0"

@@ -10,6 +10,8 @@ Day 3: price-time priority queue per price level (see price_level.pxd) and
 Day 4: limit order book with insert and cancel (see order_book.pxd) and the
        OrderBook wrapper used to test it from Python.
 Day 5: matching of crossing limit orders (see matching.pxd): OrderBook.submit().
+Day 6: the matching runs in `with nogil:` blocks (GIL released); submit_batch() feeds many
+       orders per nogil section; a per-book mutex keeps shared use from threads safe.
 """
 import time
 from libc.stdint cimport uint8_t, uint64_t
@@ -32,6 +34,17 @@ from chronos_engine.order_book cimport (
 from chronos_engine.matching cimport (
     Fill, FillBuffer, fillbuf_init, fillbuf_free, fillbuf_clear, book_submit,
 )
+
+cdef extern from "<mutex>" namespace "std" nogil:
+    cdef cppclass mutex:
+        mutex() noexcept
+        void lock() noexcept
+        void unlock() noexcept
+
+
+cdef extern from "Python.h":
+    int PyGILState_Check() nogil     # 1 if this thread holds the GIL, else 0 (safe to call without it)
+
 
 cdef extern from *:
     """
@@ -301,23 +314,51 @@ cdef inline BookSide* _side_ptr(Book* b, bytes side) except NULL:
 
 cdef class OrderBook:
     """
-    Python-visible wrapper around the C limit order book (insert / cancel / queries).
-    Test scaffolding: the engine itself calls the nogil C functions directly.
+    Python-visible wrapper around the C limit order book.
+
+    Day 6: matching runs inside `with nogil:` blocks, i.e. WITHOUT the Python GIL,
+    so other Python threads keep running while the engine matches. Because that
+    would let two threads touch one book at the same moment, every method takes
+    the book's own C++ mutex first (waiting for it with the GIL released); the
+    matching code itself never calls back into Python while holding that mutex.
     """
     cdef Book _book
+    cdef mutex _lock
+    cdef int _gil_probe          # PyGILState_Check() seen inside the last nogil match (-1 = none yet)
 
     def __cinit__(self):
+        self._gil_probe = -1
         if book_init(&self._book) != BOOK_OK:
             raise MemoryError()
 
     def __dealloc__(self):
         book_destroy(&self._book)
 
+    cdef void _acquire(self) noexcept:
+        with nogil:                  # wait for the book mutex WITHOUT holding the GIL
+            self._lock.lock()
+
+    cdef void _release(self) noexcept:
+        self._lock.unlock()
+
+    @property
+    def gil_held_in_last_match(self):
+        """1 if the GIL was held while the last submit/submit_batch matched, 0 if released, -1 if none yet."""
+        return self._gil_probe
+
     def __len__(self):
-        return self._book.ids.used
+        self._acquire()
+        try:
+            return self._book.ids.used
+        finally:
+            self._release()
 
     def __contains__(self, unsigned long long order_id):
-        return idmap_find(&self._book.ids, order_id) != NULL
+        self._acquire()
+        try:
+            return idmap_find(&self._book.ids, order_id) != NULL
+        finally:
+            self._release()
 
     cdef int _insert(self, Order* order) except -1:
         cdef int rc = book_insert(&self._book, order)
@@ -340,20 +381,26 @@ cdef class OrderBook:
         order.price = price
         order.quantity = quantity
         order.side = side[0]
-        self._insert(&order)
+        self._acquire()
+        try:
+            self._insert(&order)
+        finally:
+            self._release()
 
     def submit(self, unsigned long long order_id, bytes side, double price,
                unsigned int quantity, unsigned long long timestamp_ns=0):
         """
         Submit a limit order: trade against crossing orders on the other side
         (best price first, oldest first, at the resting order's price), then rest
-        any remainder. Returns the fills as [(taker_id, maker_id, price, quantity)].
+        any remainder. The matching runs with the GIL released.
+        Returns the fills as [(taker_id, maker_id, price, quantity)].
         Raises ValueError for invalid input or an id already resting on the book.
         """
         cdef Order order
         cdef FillBuffer fills
         cdef unsigned int i
         cdef int rc
+        cdef int gil_state = -1
         if len(side) != 1:
             raise ValueError("side must be b'B' or b'S'")
         order.order_id = order_id
@@ -362,12 +409,19 @@ cdef class OrderBook:
         order.quantity = quantity
         order.side = side[0]
         fillbuf_init(&fills)
-        rc = book_submit(&self._book, &order, &fills)
-        out = []
-        for i in range(fills.count):
-            out.append((fills.items[i].taker_id, fills.items[i].maker_id,
-                        fills.items[i].price, fills.items[i].quantity))
-        fillbuf_free(&fills)
+        self._acquire()
+        try:
+            with nogil:                                  # <-- core matching without the GIL
+                gil_state = PyGILState_Check()
+                rc = book_submit(&self._book, &order, &fills)
+            self._gil_probe = gil_state
+            out = []
+            for i in range(fills.count):
+                out.append((fills.items[i].taker_id, fills.items[i].maker_id,
+                            fills.items[i].price, fills.items[i].quantity))
+        finally:
+            self._release()
+            fillbuf_free(&fills)
         if rc == BOOK_OK:
             return out
         if rc == BOOK_ERR_DUPLICATE:
@@ -375,6 +429,74 @@ cdef class OrderBook:
         if rc == BOOK_ERR_INVALID:
             raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, 0 < price < 1e15)")
         raise MemoryError()
+
+    def submit_batch(self, const unsigned char[::1] data, bint collect=True):
+        """
+        Submit many orders in ONE nogil section. `data` is a sequence of 29-byte wire
+        messages (struct format "=QcdIQ"), e.g. a slice of the shared ring buffer.
+        Invalid or duplicate-id orders are counted as rejected and skipped.
+        Returns {"orders", "rejected", "fill_count", "filled_quantity", "fills"};
+        "fills" is a list of (taker_id, maker_id, price, quantity) when collect=True, else None.
+        """
+        cdef Py_ssize_t wire_size = sizeof(WireOrder)
+        cdef Py_ssize_t n = data.shape[0] // wire_size
+        cdef Py_ssize_t i
+        cdef Py_ssize_t done = 0
+        cdef unsigned int j
+        cdef WireOrder wire
+        cdef Order order
+        cdef FillBuffer fills
+        cdef const unsigned char* base
+        cdef int rc
+        cdef int gil_state = -1
+        cdef int out_of_memory = 0
+        cdef unsigned long long rejected = 0
+        cdef unsigned long long fill_count = 0
+        cdef unsigned long long filled_quantity = 0
+        if data.shape[0] % wire_size != 0:
+            raise ValueError("buffer length must be a multiple of 29 bytes")
+        if n == 0:
+            return {"orders": 0, "rejected": 0, "fill_count": 0,
+                    "filled_quantity": 0, "fills": [] if collect else None}
+        base = &data[0]
+        fillbuf_init(&fills)
+        self._acquire()
+        try:
+            with nogil:                                  # <-- whole batch without the GIL
+                gil_state = PyGILState_Check()
+                for i in range(n):
+                    memcpy(&wire, base + i * wire_size, wire_size)
+                    order_from_wire(&order, &wire)
+                    rc = book_submit(&self._book, &order, &fills)
+                    if rc == BOOK_ERR_NOMEM:
+                        out_of_memory = 1
+                        break
+                    done += 1
+                    if rc != BOOK_OK:
+                        rejected += 1
+                    if not collect:
+                        for j in range(fills.count):
+                            filled_quantity += fills.items[j].quantity
+                        fill_count += fills.count
+                        fillbuf_clear(&fills)
+                if collect:
+                    for j in range(fills.count):
+                        filled_quantity += fills.items[j].quantity
+                    fill_count = fills.count
+            self._gil_probe = gil_state
+            out = None
+            if collect:
+                out = []
+                for j in range(fills.count):
+                    out.append((fills.items[j].taker_id, fills.items[j].maker_id,
+                                fills.items[j].price, fills.items[j].quantity))
+        finally:
+            self._release()
+            fillbuf_free(&fills)
+        if out_of_memory:
+            raise MemoryError()
+        return {"orders": done, "rejected": rejected, "fill_count": fill_count,
+                "filled_quantity": filled_quantity, "fills": out}
 
     def insert_wire(self, const unsigned char[::1] data):
         """Insert one 29-byte wire message (struct format "=QcdIQ") straight from bytes."""
@@ -384,65 +506,106 @@ cdef class OrderBook:
             raise ValueError("buffer shorter than one wire order (29 bytes)")
         memcpy(&wire, &data[0], sizeof(WireOrder))
         order_from_wire(&order, &wire)
-        self._insert(&order)
+        self._acquire()
+        try:
+            self._insert(&order)
+        finally:
+            self._release()
 
     def cancel(self, unsigned long long order_id):
         """Cancel a resting order. Returns True if it was on the book, else False."""
-        return book_cancel(&self._book, order_id) == BOOK_OK
+        self._acquire()
+        try:
+            return book_cancel(&self._book, order_id) == BOOK_OK
+        finally:
+            self._release()
 
     def best_bid(self):
         """(price, total_quantity) of the best bid level, or None."""
-        cdef PriceLevel* lvl = side_best(&self._book.bids)
-        if lvl == NULL:
-            return None
-        return (lvl.price, lvl.total_quantity)
+        cdef PriceLevel* lvl
+        self._acquire()
+        try:
+            lvl = side_best(&self._book.bids)
+            if lvl == NULL:
+                return None
+            return (lvl.price, lvl.total_quantity)
+        finally:
+            self._release()
 
     def best_ask(self):
         """(price, total_quantity) of the best ask level, or None."""
-        cdef PriceLevel* lvl = side_best(&self._book.asks)
-        if lvl == NULL:
-            return None
-        return (lvl.price, lvl.total_quantity)
+        cdef PriceLevel* lvl
+        self._acquire()
+        try:
+            lvl = side_best(&self._book.asks)
+            if lvl == NULL:
+                return None
+            return (lvl.price, lvl.total_quantity)
+        finally:
+            self._release()
 
     def spread(self):
         """best ask - best bid, or None when one side is empty."""
-        cdef PriceLevel* bid = side_best(&self._book.bids)
-        cdef PriceLevel* ask = side_best(&self._book.asks)
-        if bid == NULL or ask == NULL:
-            return None
-        return ask.price - bid.price
+        cdef PriceLevel* bid
+        cdef PriceLevel* ask
+        self._acquire()
+        try:
+            bid = side_best(&self._book.bids)
+            ask = side_best(&self._book.asks)
+            if bid == NULL or ask == NULL:
+                return None
+            return ask.price - bid.price
+        finally:
+            self._release()
 
     def level_count(self, bytes side):
-        return _side_ptr(&self._book, side).count
+        cdef BookSide* s = _side_ptr(&self._book, side)
+        self._acquire()
+        try:
+            return s.count
+        finally:
+            self._release()
 
     def depth(self, bytes side, unsigned int levels=5):
         """Top `levels` price levels of a side, best first: [(price, total_qty, order_count)]."""
         cdef BookSide* s = _side_ptr(&self._book, side)
         cdef unsigned int i
         out = []
-        for i in range(s.count):
-            if i >= levels:
-                break
-            out.append((s.levels[i].price, s.levels[i].total_quantity, s.levels[i].order_count))
+        self._acquire()
+        try:
+            for i in range(s.count):
+                if i >= levels:
+                    break
+                out.append((s.levels[i].price, s.levels[i].total_quantity, s.levels[i].order_count))
+        finally:
+            self._release()
         return out
 
     def level_orders(self, bytes side, double price):
         """[(order_id, quantity), ...] at one price in time priority order ([] if no level)."""
-        cdef PriceLevel* lvl = side_find_level(_side_ptr(&self._book, side), price)
+        cdef BookSide* s = _side_ptr(&self._book, side)
+        cdef PriceLevel* lvl
         cdef OrderNode* node
         out = []
-        if lvl == NULL:
-            return out
-        node = lvl.head
-        while node != NULL:
-            out.append((node.order.order_id, node.order.quantity))
-            node = node.next
+        self._acquire()
+        try:
+            lvl = side_find_level(s, price)
+            if lvl != NULL:
+                node = lvl.head
+                while node != NULL:
+                    out.append((node.order.order_id, node.order.quantity))
+                    node = node.next
+        finally:
+            self._release()
         return out
 
     def check_integrity(self):
         """Verify sorting, links, totals and the id table against each other."""
-        return bool(book_check(&self._book))
-
+        self._acquire()
+        try:
+            return bool(book_check(&self._book))
+        finally:
+            self._release()
 
 def bench_insert_cancel(int n=100000):
     """
@@ -519,3 +682,12 @@ def bench_match(int n=100000):
     if rc != 0:
         raise RuntimeError("benchmark operation failed")
     return (t1 - t0) / n
+
+
+def gil_check_demo():
+    """(held_outside, held_inside): PyGILState_Check() before and inside a `with nogil:` block -> (1, 0)."""
+    cdef int outside = PyGILState_Check()
+    cdef int inside
+    with nogil:
+        inside = PyGILState_Check()
+    return (outside, inside)
