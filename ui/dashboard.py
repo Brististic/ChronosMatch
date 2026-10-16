@@ -12,6 +12,7 @@ TARGET_OPS = 100_000   # target throughput from the project plan
 FILL_BUFFER = 500      # how many recent fills the UI keeps
 
 MIN_H, MIN_W = 20, 70  # smallest terminal the layout fits in
+PAGE = 10              # lines moved by PgUp / PgDn
 
 # Binary layout of one matched fill coming from the engine.
 # PLACEHOLDER: confirm the real layout with the IPC/engine members.
@@ -137,6 +138,35 @@ class ThroughputMeter:
         return (c1 - c0) / dt if dt > 0 else 0.0
 
 
+class LogView:
+    """Scroll state of the trade log.
+
+    offset = how many fills back from the newest one the bottom row is.
+    offset 0 means 'follow': the newest trade is always visible.
+    """
+
+    def __init__(self):
+        self.offset = 0
+        self.follow = True
+        self.last_total = 0
+
+    def sync(self, reader):
+        """Call once per frame. Keeps a scrolled-back view from drifting."""
+        new = reader.fill_total - self.last_total
+        self.last_total = reader.fill_total
+        if not self.follow and new > 0:
+            self.offset += new
+
+    def scroll(self, delta):
+        """delta > 0 goes back in history, delta < 0 goes toward newest."""
+        self.offset = max(0, self.offset + delta)
+        self.follow = self.offset == 0
+
+    def resume(self):
+        self.offset = 0
+        self.follow = True
+
+
 def put(win, y, x, text, attr=0):
     """addstr that never crashes or wraps if the window is too small."""
     try:
@@ -228,32 +258,59 @@ def draw_metrics(win, meter):
     win.noutrefresh()
 
 
-def draw_log(win, reader):
+def fmt_time(ts_ns):
+    """Nanosecond timestamp -> HH:MM:SS.mmm in local time."""
+    secs = ts_ns // 1_000_000_000
+    ms = (ts_ns // 1_000_000) % 1000
+    return time.strftime("%H:%M:%S", time.localtime(secs)) + f".{ms:03d}"
+
+
+def draw_log(win, reader, view):
     draw_panel(win, "Trade Log")
     h, _ = win.getmaxyx()
 
-    put(win, 1, 2, f"fills ingested: {reader.fill_total:,}", curses.A_BOLD)
+    # row 1 = status line, row 2 = column headers, rows 3.. = trades
+    rows = max(0, h - 4)
+    total = len(reader.fills)
+    view.offset = min(view.offset, max(0, total - rows))
+    if view.offset == 0:
+        view.follow = True
 
-    rows = max(0, h - 3)
-    recent = list(reader.fills)[-rows:] if rows else []
-    for i, f in enumerate(recent):
-        side = "BUY " if f.side == SIDE_BUY else "SELL"
-        put(win, 2 + i, 2, f"#{f.order_id:<9} {side} {f.qty:>5} @ {f.price:>9.2f}")
+    if view.follow:
+        status = "LIVE"
+        status_attr = curses.A_BOLD
+    else:
+        status = f"PAUSED  +{view.offset} newer  (f: resume)"
+        status_attr = curses.A_REVERSE
+    put(win, 1, 2, f"{status}   fills: {reader.fill_total:,}", status_attr)
+    put(win, 2, 2, f"{'TIME':<13}{'ORDER':<11}{'SIDE':<6}{'QTY':>6}   {'PRICE':>9}",
+        curses.A_BOLD)
+
+    end = total - view.offset
+    start = max(0, end - rows)
+    visible = list(reader.fills)[start:end]
+    for i, f in enumerate(visible):
+        side = "BUY" if f.side == SIDE_BUY else "SELL"
+        line = (f"{fmt_time(f.ts_ns):<13}#{f.order_id:<10}{side:<6}"
+                f"{f.qty:>6} @ {f.price:>9.2f}")
+        newest = view.follow and i == len(visible) - 1
+        put(win, 3 + i, 2, line, curses.A_BOLD if newest else 0)
 
     win.noutrefresh()
 
 
-def draw(wins, reader, meter):
+def draw(wins, reader, meter, view):
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
     wins["header"].noutrefresh()
 
     draw_book(wins["book"], reader.book)
     draw_metrics(wins["metrics"], meter)
-    draw_log(wins["log"], reader)
+    draw_log(wins["log"], reader, view)
 
     wins["footer"].erase()
-    put(wins["footer"], 0, 1, "q: quit")
+    put(wins["footer"], 0, 1,
+        "q: quit   Up/Down: scroll log   PgUp/PgDn: page   f/End: follow")
     wins["footer"].noutrefresh()
 
     curses.doupdate()
@@ -286,18 +343,30 @@ def main(stdscr):
     wins = build_windows(stdscr)
     reader = EngineReader(MockEngineStream())  # swap in the real stream later
     meter = ThroughputMeter()
+    view = LogView()
 
     while True:
         meter.record(reader.poll())
+        view.sync(reader)
 
         if wins is None:
             draw_too_small(stdscr)
         else:
-            draw(wins, reader, meter)
+            draw(wins, reader, meter, view)
 
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
+        elif key == curses.KEY_UP:
+            view.scroll(1)
+        elif key == curses.KEY_DOWN:
+            view.scroll(-1)
+        elif key == curses.KEY_PPAGE:
+            view.scroll(PAGE)
+        elif key == curses.KEY_NPAGE:
+            view.scroll(-PAGE)
+        elif key in (ord("f"), ord("F"), curses.KEY_END):
+            view.resume()
         # KEY_RESIZE is the normal signal, the size check is a safety net
         if key == curses.KEY_RESIZE or stdscr.getmaxyx() != size:
             wins, size = handle_resize(stdscr)
