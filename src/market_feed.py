@@ -169,3 +169,19 @@ class MarketSimulator:
 
         self.asset_prices[symbol] = round(curr_price, 2)
         return packets
+
+
+    def generate_correlated_multi_asset_batch(
+        self,
+        batch_size_per_symbol: int = 50,
+        macro_market_drift: float = 0.0002,
+    ) -> Dict[str, List[bytes]]:
+        """Day 8 Member 3: Generates parallel order batches with macroeconomic drift correlation across all symbols."""
+        results: Dict[str, List[bytes]] = {}
+
+        for sym in self.symbols:
+            # Apply shared macro shock + individual asset vol
+            self.asset_prices[sym] = round(max(0.01, self.asset_prices[sym] * (1.0 + macro_market_drift)), 2)
+            results[sym] = self.generate_stress_burst(sym, count=batch_size_per_symbol)
+
+        return results

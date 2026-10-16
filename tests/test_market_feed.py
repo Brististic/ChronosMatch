@@ -75,3 +75,11 @@ def test_l2_depth_ladder_generation():
     for i in range(len(unpacked_bids) - 1):
         assert unpacked_bids[i].price > unpacked_bids[i + 1].price
         assert unpacked_asks[i].price < unpacked_asks[i + 1].price
+
+
+def test_correlated_multi_asset_batch_generation():
+    sim = MarketSimulator(symbols=["AAPL", "MSFT", "TSLA"])
+    batch = sim.generate_correlated_multi_asset_batch(batch_size_per_symbol=25, macro_market_drift=0.01)
+
+    assert set(batch.keys()) == {"AAPL", "MSFT", "TSLA"}
+    assert all(len(orders) == 25 for orders in batch.values())

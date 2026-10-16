@@ -1,62 +1,73 @@
 import os
+import time
 import pytest
 from src.ipc_sync import MmapProcessLock
 
-TEST_LOCK_FILE = "test_chronos_sync.lock"
 
+def test_lock_acquire_and_release(tmp_path):
+    lock_file = str(tmp_path / "test.lock")
+    lock = MmapProcessLock(lock_file, create=True)
 
-@pytest.fixture
-def clean_lock():
-    if os.path.exists(TEST_LOCK_FILE):
-        os.remove(TEST_LOCK_FILE)
-    lock = MmapProcessLock(TEST_LOCK_FILE, spin_timeout_sec=0.1, create=True)
-    yield lock
-    lock.close()
-    if os.path.exists(TEST_LOCK_FILE):
-        os.remove(TEST_LOCK_FILE)
-
-
-def test_lock_acquire_and_release(clean_lock):
-    lock = clean_lock
-    assert lock.acquire() is True
-    # Locked state verify
-    is_locked, pid = lock._read_state()
-    assert is_locked == 1
-    assert pid == os.getpid()
+    acquired = lock.acquire(timeout_sec=1.0)
+    assert acquired is True
+    assert lock._read_state() == (1, os.getpid())
 
     lock.release()
-    is_locked, pid = lock._read_state()
-    assert is_locked == 0
-    assert pid == 0
+    assert lock._read_state() == (0, 0)
+    lock.close()
 
 
-def test_lock_context_manager(clean_lock):
-    lock = clean_lock
+def test_lock_context_manager(tmp_path):
+    lock_file = str(tmp_path / "test_ctx.lock")
+    lock = MmapProcessLock(lock_file, create=True)
+
     with lock:
-        is_locked, _ = lock._read_state()
-        assert is_locked == 1
+        assert lock._read_state() == (1, os.getpid())
 
-    is_locked, _ = lock._read_state()
-    assert is_locked == 0
+    assert lock._read_state() == (0, 0)
+    lock.close()
 
 
-def test_lock_timeout_on_contention():
-    if os.path.exists(TEST_LOCK_FILE):
-        os.remove(TEST_LOCK_FILE)
+def test_lock_timeout_on_contention(tmp_path):
+    lock_file = str(tmp_path / "test_timeout.lock")
+    lock1 = MmapProcessLock(lock_file, create=True)
+    lock2 = MmapProcessLock(lock_file, create=False)
 
-    lock1 = MmapProcessLock(TEST_LOCK_FILE, spin_timeout_sec=0.05, create=True)
-    assert lock1.acquire() is True
+    assert lock1.acquire(timeout_sec=0.5) is True
 
-    # Second instance attempting to acquire while locked must timeout
-    lock2 = MmapProcessLock(TEST_LOCK_FILE, spin_timeout_sec=0.05, create=False)
-    assert lock2.acquire() is False
+    # Lock 2 should timeout while Lock 1 holds it
+    assert lock2.acquire(timeout_sec=0.1) is False
 
     lock1.release()
-    # Now lock2 can acquire
-    assert lock2.acquire() is True
-    lock2.release()
+    assert lock2.acquire(timeout_sec=0.5) is True
 
+    lock2.release()
     lock1.close()
     lock2.close()
-    if os.path.exists(TEST_LOCK_FILE):
-        os.remove(TEST_LOCK_FILE)
+
+
+def test_multi_ring_ipc_hub_routing(tmp_path):
+    from src.ipc_hub import MultiRingIPCHub
+    from src.schema import pack_order, unpack_order
+
+    symbols = ["AAPL", "MSFT"]
+    hub = MultiRingIPCHub(symbols=symbols, base_dir=str(tmp_path), capacity_per_ring=64, create=True)
+
+    now = time.perf_counter_ns()
+    aapl_orders = [pack_order(1, b"B", 180.0, 10, now)]
+    msft_orders = [pack_order(2, b"S", 410.0, 20, now)]
+
+    hub.write_symbol_batch("AAPL", aapl_orders)
+    hub.write_symbol_batch("MSFT", msft_orders)
+
+    read_data = hub.round_robin_read(max_count_per_symbol=10)
+    assert len(read_data["AAPL"]) == 1
+    assert len(read_data["MSFT"]) == 1
+
+    o1 = unpack_order(read_data["AAPL"][0])
+    o2 = unpack_order(read_data["MSFT"][0])
+    assert o1.order_id == 1 and o1.price == 180.0
+    assert o2.order_id == 2 and o2.price == 410.0
+
+    hub.close()
+    hub.cleanup_files()
