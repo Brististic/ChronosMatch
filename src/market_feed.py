@@ -7,7 +7,7 @@ from src.schema import pack_order
 
 
 class MarketSimulator:
-    """Multi-asset market feed with stochastic drift, power-law sizes, volatility shocks, and L2 depth dynamics."""
+    """Multi-asset market feed with stochastic drift, power-law sizes, volatility shocks, L2 depth, and stress generators."""
 
     def __init__(
         self,
@@ -45,11 +45,10 @@ class MarketSimulator:
     def generate_l2_depth_ladder(
         self, symbol: str, levels: int = 5, tick_size: float = 0.01
     ) -> Tuple[List[bytes], List[bytes]]:
-        """Day 5: Generates matched L2 bid/ask ladders based on current microstructural spread."""
+        """Generates matched L2 bid/ask ladders based on current microstructural spread."""
         mid = self._step_price(symbol)
         vol = self.volatilities[symbol]
 
-        # Spread widens with volatility
         half_spread = max(tick_size, round(mid * vol * random.uniform(0.8, 1.5), 2))
         best_bid = round(mid - half_spread, 2)
         best_ask = round(mid + half_spread, 2)
@@ -59,19 +58,33 @@ class MarketSimulator:
         now_ns = time.perf_counter_ns()
 
         for i in range(levels):
-            # Bid side (descending prices)
             self.order_counter += 1
             bid_price = round(best_bid - (i * tick_size), 2)
             bid_qty = self._sample_order_quantity() * (i + 1)
             bids.append(pack_order(self.order_counter, b"B", bid_price, bid_qty, now_ns))
 
-            # Ask side (ascending prices)
             self.order_counter += 1
             ask_price = round(best_ask + (i * tick_size), 2)
             ask_qty = self._sample_order_quantity() * (i + 1)
             asks.append(pack_order(self.order_counter, b"S", ask_price, ask_qty, now_ns))
 
         return bids, asks
+
+    def generate_stress_burst(self, symbol: str, count: int = 1000) -> List[bytes]:
+        """Day 7: Vectorized in-memory high-rate order burst for throughput saturation benchmarking."""
+        packets = []
+        base = self.asset_prices[symbol]
+        now_ns = time.perf_counter_ns()
+
+        for _ in range(count):
+            self.order_counter += 1
+            side = b"B" if (self.order_counter % 2 == 0) else b"S"
+            offset = (random.random() - 0.5) * 0.50
+            price = round(max(0.01, base + offset), 2)
+            qty = self._sample_order_quantity()
+            packets.append(pack_order(self.order_counter, side, price, qty, now_ns))
+
+        return packets
 
     async def generate_ticks(
         self,
@@ -111,7 +124,6 @@ class MarketSimulator:
         burst_size: int = 50,
         price_impact_pct: float = 0.05,
     ) -> List[bytes]:
-        """Simulates a sudden liquidity sweep / market shock event."""
         packets = []
         base = self.asset_prices[shock_symbol]
         side = b"S" if random.random() < 0.5 else b"B"
@@ -141,15 +153,14 @@ class MarketSimulator:
         price_decrement = (curr_price * crash_drop_pct) / steps
         now_ns = time.perf_counter_ns()
 
-        for i in range(steps):
+        for _ in range(steps):
             self.order_counter += 1
-            # Aggressive dump or panic cancellation
             if random.random() < panic_cancel_rate and self.active_orders[symbol]:
                 target_id = self.active_orders[symbol].pop(0)
                 pkt = pack_order(target_id, b"C", round(curr_price, 2), 0, now_ns)
             else:
                 curr_price = max(0.01, curr_price - price_decrement)
-                qty = self._sample_order_quantity(alpha=1.1) * 10  # Panic volumes
+                qty = self._sample_order_quantity(alpha=1.1) * 10
                 oid = self.order_counter
                 self.active_orders[symbol].append(oid)
                 pkt = pack_order(oid, b"S", round(curr_price, 2), qty, now_ns)
