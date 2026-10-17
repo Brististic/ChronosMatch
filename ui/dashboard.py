@@ -1,62 +1,93 @@
-import curses
-
-REFRESH_MS = 100  # UI refresh interval
-
-
-def build_windows(stdscr):
-    h, w = stdscr.getmaxyx()
-    header_h, footer_h = 1, 1
-    body_h = h - header_h - footer_h
-    top_h = body_h * 6 // 10
-    log_h = body_h - top_h
-    left_w = w // 2
-
-    return {
-        "header": curses.newwin(header_h, w, 0, 0),
-        "book": curses.newwin(top_h, left_w, header_h, 0),
-        "metrics": curses.newwin(top_h, w - left_w, header_h, left_w),
-        "log": curses.newwin(log_h, w, header_h + top_h, 0),
-        "footer": curses.newwin(footer_h, w, h - 1, 0),
-    }
+import time
+from typing import Dict, List, Tuple, Optional
 
 
-def draw_panel(win, title):
-    win.erase()
-    win.box()
-    win.addstr(0, 2, f" {title} ")
-    win.noutrefresh()
+class MultiAssetOrderBookUI:
+    """Maintains order book depth, spread, and latency metrics across multiple trading symbols."""
+
+    def __init__(self, symbols: List[str]):
+        self.symbols = symbols
+        self.books: Dict[str, Dict[str, any]] = {}
+        for sym in symbols:
+            self.books[sym] = {
+                "mid": 100.0,
+                "bids": [(99.95 - i * 0.05, 50 + i * 10) for i in range(5)],
+                "asks": [(100.05 + i * 0.05, 50 + i * 10) for i in range(5)],
+                "total_orders": 0,
+                "latencies": [],
+            }
+
+    def update_symbol_order(self, symbol: str, side: bytes, price: float, quantity: int, latency_us: float = 0.0):
+        """Updates internal order depth and latency metrics for a designated symbol."""
+        if symbol not in self.books:
+            return
+
+        book = self.books[symbol]
+        book["total_orders"] += 1
+        book["mid"] = price
+        if latency_us > 0:
+            book["latencies"].append(latency_us)
+
+        # Update top level ladder dynamically
+        if side == b"B":
+            book["bids"][0] = (round(price, 2), quantity)
+            # Maintain ask spread sanity
+            if book["asks"][0][0] <= price:
+                book["asks"][0] = (round(price + 0.05, 2), 50)
+        elif side == b"S":
+            book["asks"][0] = (round(price, 2), quantity)
+            # Maintain bid spread sanity
+            if book["bids"][0][0] >= price:
+                book["bids"][0] = (round(price - 0.05, 2), 50)
+
+    def get_symbol_metrics(self, symbol: str) -> Dict[str, any]:
+        """Calculates current spread and latency profile for a symbol."""
+        if symbol not in self.books:
+            return {}
+
+        book = self.books[symbol]
+        best_bid = book["bids"][0][0]
+        best_ask = book["asks"][0][0]
+        spread = round(max(0.0, best_ask - best_bid), 2)
+
+        lats = book["latencies"]
+        p50 = round(sorted(lats)[len(lats) // 2], 2) if lats else 0.0
+
+        return {
+            "symbol": symbol,
+            "mid": book["mid"],
+            "spread": spread,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "total_orders": book["total_orders"],
+            "p50_latency_us": p50,
+        }
+
+    def render_text_snapshot(self) -> str:
+        """Generates a headless multi-book text snapshot suitable for terminals and CI testing."""
+        lines = [
+            "=" * 70,
+            f"{'CHRONOSMATCH MULTI-ASSET DASHBOARD':^70}",
+            "=" * 70,
+        ]
+        for sym in self.symbols:
+            m = self.get_symbol_metrics(sym)
+            lines.append(
+                f"[{sym}] Mid: ${m['mid']:.2f} | Spread: ${m['spread']:.2f} | "
+                f"Top Bid: ${m['best_bid']:.2f} | Top Ask: ${m['best_ask']:.2f} | "
+                f"Orders: {m['total_orders']} | P50: {m['p50_latency_us']} us"
+            )
+        lines.append("=" * 70)
+        return "\n".join(lines)
 
 
-def draw(wins):
-    wins["header"].erase()
-    wins["header"].addstr(0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
-    wins["header"].noutrefresh()
+# Backwards-compatibility alias for single-book mock tests
+class MockOrderBook:
+    def __init__(self, mid: float = 180.0):
+        self.mid = mid
+        self.bids = [(mid - 0.05, 100)]
+        self.asks = [(mid + 0.05, 100)]
 
-    draw_panel(wins["book"], "Order Book")
-    draw_panel(wins["metrics"], "Latency (us)")
-    draw_panel(wins["log"], "Trade Log")
-
-    wins["footer"].erase()
-    wins["footer"].addstr(0, 1, "q: quit")
-    wins["footer"].noutrefresh()
-
-    curses.doupdate()
-
-
-def main(stdscr):
-    curses.curs_set(0)
-    stdscr.timeout(REFRESH_MS)
-
-    wins = build_windows(stdscr)
-    while True:
-        draw(wins)
-        key = stdscr.getch()
-        if key in (ord("q"), ord("Q")):
-            break
-        if key == curses.KEY_RESIZE:
-            stdscr.clear()
-            wins = build_windows(stdscr)
-
-
-if __name__ == "__main__":
-    curses.wrapper(main)
+    def update(self):
+        self.bids[0] = (self.mid - 0.05, 100)
+        self.asks[0] = (self.mid + 0.05, 100)

@@ -45,3 +45,29 @@ def test_engine_feeder_batch_consumption(feeder_env):
     stats = feeder.get_latency_stats()
     assert stats["count"] == 15
     assert stats["avg_us"] >= 0
+
+def test_multi_asset_orderbook_ui_tracking():
+    from ui.dashboard import MultiAssetOrderBookUI
+
+    symbols = ["AAPL", "MSFT", "TSLA"]
+    ui = MultiAssetOrderBookUI(symbols=symbols)
+
+    # Ingest mock orders into individual symbols
+    ui.update_symbol_order("AAPL", b"B", 182.50, 100, latency_us=12.4)
+    ui.update_symbol_order("MSFT", b"S", 412.00, 50, latency_us=18.1)
+    ui.update_symbol_order("TSLA", b"B", 255.30, 200, latency_us=9.8)
+
+    aapl_m = ui.get_symbol_metrics("AAPL")
+    msft_m = ui.get_symbol_metrics("MSFT")
+    tsla_m = ui.get_symbol_metrics("TSLA")
+
+    assert aapl_m["mid"] == 182.50
+    assert aapl_m["best_bid"] == 182.50
+    assert aapl_m["p50_latency_us"] == 12.4
+    assert aapl_m["best_ask"] > aapl_m["best_bid"]
+
+    assert msft_m["mid"] == 412.00
+    assert msft_m["best_ask"] == 412.00
+
+    snapshot = ui.render_text_snapshot()
+    assert "AAPL" in snapshot and "MSFT" in snapshot and "TSLA" in snapshot
