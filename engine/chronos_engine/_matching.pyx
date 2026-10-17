@@ -10,11 +10,15 @@ Day 3: price-time priority queue per price level (see price_level.pxd) and
 Day 4: limit order book with insert and cancel (see order_book.pxd) and the
        OrderBook wrapper used to test it from Python.
 Day 5: matching of crossing limit orders (see matching.pxd): OrderBook.submit().
+Day 8: price levels are found through a contiguous table indexed by integer price ticks
+       (O(1) lookup instead of binary search); prices are exact integer ticks (price_scale).
+Day 7: partial execution with remainder persistence; every fill carries a trade id and the
+       quantity left on both orders (submit_traced), so a ledger can be rebuilt from fills alone.
 Day 6: the matching runs in `with nogil:` blocks (GIL released); submit_batch() feeds many
        orders per nogil section; a per-book mutex keeps shared use from threads safe.
 """
 import time
-from libc.stdint cimport uint8_t, uint64_t
+from libc.stdint cimport int64_t, uint8_t, uint64_t
 from libc.string cimport memcpy
 
 from chronos_engine.order_types cimport (
@@ -27,12 +31,13 @@ from chronos_engine.price_level cimport (
 )
 from chronos_engine.order_book cimport (
     Book, BookSide, BOOK_OK, BOOK_ERR_DUPLICATE, BOOK_ERR_INVALID,
-    BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND,
+    BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND, BOOK_ERR_RANGE,
     book_init, book_destroy, book_insert, book_cancel, book_check,
-    side_best, side_find_level, idmap_find,
+    side_best, side_next, side_find_tick, price_to_tick, idmap_find, IdEntry,
 )
 from chronos_engine.matching cimport (
-    Fill, FillBuffer, fillbuf_init, fillbuf_free, fillbuf_clear, book_submit,
+    Fill, FillBuffer, SubmitSummary, fillbuf_init, fillbuf_free, fillbuf_clear,
+    book_submit, book_submit_ex,
 )
 
 cdef extern from "<mutex>" namespace "std" nogil:
@@ -198,7 +203,7 @@ cdef class LevelQueue:
     cdef PriceLevel _lvl
 
     def __cinit__(self, double price):
-        level_init(&self._lvl, price)
+        level_init(&self._lvl, price, 0)
 
     def __dealloc__(self):
         cdef OrderNode* node = self._lvl.head
@@ -326,9 +331,11 @@ cdef class OrderBook:
     cdef mutex _lock
     cdef int _gil_probe          # PyGILState_Check() seen inside the last nogil match (-1 = none yet)
 
-    def __cinit__(self):
+    def __cinit__(self, long long price_scale=100):
+        if price_scale < 1 or price_scale > 1000000:
+            raise ValueError("price_scale must be between 1 and 1,000,000 (ticks per 1.00)")
         self._gil_probe = -1
-        if book_init(&self._book) != BOOK_OK:
+        if book_init(&self._book, price_scale) != BOOK_OK:
             raise MemoryError()
 
     def __dealloc__(self):
@@ -340,6 +347,15 @@ cdef class OrderBook:
 
     cdef void _release(self) noexcept:
         self._lock.unlock()
+
+    @property
+    def price_scale(self):
+        """Ticks per 1.00 of price (100 means the smallest price step is 0.01)."""
+        return self._book.price_scale
+
+    @property
+    def tick_size(self):
+        return 1.0 / self._book.price_scale
 
     @property
     def gil_held_in_last_match(self):
@@ -367,7 +383,9 @@ cdef class OrderBook:
         if rc == BOOK_ERR_DUPLICATE:
             raise ValueError("duplicate order id")
         if rc == BOOK_ERR_INVALID:
-            raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, 0 < price < 1e15)")
+            raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, price > 0 and a whole number of ticks)")
+        if rc == BOOK_ERR_RANGE:
+            raise ValueError("price is too far from the other prices on this side of the book")
         raise MemoryError()
 
     def insert(self, unsigned long long order_id, bytes side, double price,
@@ -387,6 +405,31 @@ cdef class OrderBook:
         finally:
             self._release()
 
+    cdef int _run_submit(self, Order* order, FillBuffer* fills, SubmitSummary* summary) noexcept:
+        # Match one order with the GIL released, under the book mutex. Returns a BookStatus.
+        cdef int rc
+        cdef int gil_state = -1
+        self._acquire()
+        try:
+            with nogil:                                  # <-- core matching without the GIL
+                gil_state = PyGILState_Check()
+                rc = book_submit_ex(&self._book, order, fills, summary)
+            self._gil_probe = gil_state
+        finally:
+            self._release()
+        return rc
+
+    cdef int _raise_for(self, int rc) except -1:
+        if rc == BOOK_OK:
+            return 0
+        if rc == BOOK_ERR_DUPLICATE:
+            raise ValueError("duplicate order id")
+        if rc == BOOK_ERR_INVALID:
+            raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, price > 0 and a whole number of ticks)")
+        if rc == BOOK_ERR_RANGE:
+            raise ValueError("price is too far from the other prices on this side of the book")
+        raise MemoryError()
+
     def submit(self, unsigned long long order_id, bytes side, double price,
                unsigned int quantity, unsigned long long timestamp_ns=0):
         """
@@ -400,7 +443,6 @@ cdef class OrderBook:
         cdef FillBuffer fills
         cdef unsigned int i
         cdef int rc
-        cdef int gil_state = -1
         if len(side) != 1:
             raise ValueError("side must be b'B' or b'S'")
         order.order_id = order_id
@@ -409,26 +451,77 @@ cdef class OrderBook:
         order.quantity = quantity
         order.side = side[0]
         fillbuf_init(&fills)
-        self._acquire()
         try:
-            with nogil:                                  # <-- core matching without the GIL
-                gil_state = PyGILState_Check()
-                rc = book_submit(&self._book, &order, &fills)
-            self._gil_probe = gil_state
+            rc = self._run_submit(&order, &fills, NULL)
             out = []
             for i in range(fills.count):
                 out.append((fills.items[i].taker_id, fills.items[i].maker_id,
                             fills.items[i].price, fills.items[i].quantity))
         finally:
-            self._release()
             fillbuf_free(&fills)
-        if rc == BOOK_OK:
-            return out
-        if rc == BOOK_ERR_DUPLICATE:
-            raise ValueError("duplicate order id")
-        if rc == BOOK_ERR_INVALID:
-            raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, 0 < price < 1e15)")
-        raise MemoryError()
+        self._raise_for(rc)
+        return out
+
+    def submit_traced(self, unsigned long long order_id, bytes side, double price,
+                      unsigned int quantity, unsigned long long timestamp_ns=0):
+        """
+        Like submit(), but returns a full audit record:
+          {"status": "FILLED" | "PARTIAL" | "RESTING",
+           "filled_quantity": int, "resting_quantity": int,
+           "fills": [(trade_id, taker_id, maker_id, price, quantity,
+                      taker_remaining, maker_remaining, timestamp_ns), ...]}
+        FILLED  = the whole order traded; PARTIAL = part traded and the remainder now rests;
+        RESTING = nothing traded and the whole order rests.
+        """
+        cdef Order order
+        cdef FillBuffer fills
+        cdef SubmitSummary summary
+        cdef unsigned int i
+        cdef int rc
+        if len(side) != 1:
+            raise ValueError("side must be b'B' or b'S'")
+        order.order_id = order_id
+        order.timestamp_ns = timestamp_ns
+        order.price = price
+        order.quantity = quantity
+        order.side = side[0]
+        fillbuf_init(&fills)
+        try:
+            rc = self._run_submit(&order, &fills, &summary)
+            out = []
+            for i in range(fills.count):
+                out.append((fills.items[i].trade_id, fills.items[i].taker_id,
+                            fills.items[i].maker_id, fills.items[i].price,
+                            fills.items[i].quantity, fills.items[i].taker_remaining,
+                            fills.items[i].maker_remaining, fills.items[i].timestamp_ns))
+        finally:
+            fillbuf_free(&fills)
+        self._raise_for(rc)
+        if summary.filled_quantity == 0:
+            status = "RESTING"
+        elif summary.filled_quantity == quantity:
+            status = "FILLED"
+        else:
+            status = "PARTIAL"
+        return {"status": status, "filled_quantity": summary.filled_quantity,
+                "resting_quantity": summary.resting_quantity, "fills": out}
+
+    def remaining(self, unsigned long long order_id):
+        """Quantity still resting for this order id, or None if it is not on the book."""
+        cdef IdEntry* e
+        self._acquire()
+        try:
+            e = idmap_find(&self._book.ids, order_id)
+            if e == NULL:
+                return None
+            return e.node.order.quantity
+        finally:
+            self._release()
+
+    @property
+    def trades_executed(self):
+        """Number of trades executed on this book so far (the last trade id)."""
+        return self._book.next_trade_id - 1
 
     def submit_batch(self, const unsigned char[::1] data, bint collect=True):
         """
@@ -562,21 +655,23 @@ cdef class OrderBook:
         cdef BookSide* s = _side_ptr(&self._book, side)
         self._acquire()
         try:
-            return s.count
+            return s.level_count
         finally:
             self._release()
 
     def depth(self, bytes side, unsigned int levels=5):
         """Top `levels` price levels of a side, best first: [(price, total_qty, order_count)]."""
         cdef BookSide* s = _side_ptr(&self._book, side)
-        cdef unsigned int i
+        cdef PriceLevel* lvl
+        cdef unsigned int n = 0
         out = []
         self._acquire()
         try:
-            for i in range(s.count):
-                if i >= levels:
-                    break
-                out.append((s.levels[i].price, s.levels[i].total_quantity, s.levels[i].order_count))
+            lvl = side_best(s)
+            while lvl != NULL and n < levels:
+                out.append((lvl.price, lvl.total_quantity, lvl.order_count))
+                n += 1
+                lvl = side_next(s, lvl)
         finally:
             self._release()
         return out
@@ -586,15 +681,17 @@ cdef class OrderBook:
         cdef BookSide* s = _side_ptr(&self._book, side)
         cdef PriceLevel* lvl
         cdef OrderNode* node
+        cdef int64_t tick
         out = []
         self._acquire()
         try:
-            lvl = side_find_level(s, price)
-            if lvl != NULL:
-                node = lvl.head
-                while node != NULL:
-                    out.append((node.order.order_id, node.order.quantity))
-                    node = node.next
+            if price_to_tick(&self._book, price, &tick):
+                lvl = side_find_tick(s, tick)
+                if lvl != NULL:
+                    node = lvl.head
+                    while node != NULL:
+                        out.append((node.order.order_id, node.order.quantity))
+                        node = node.next
         finally:
             self._release()
         return out
@@ -607,9 +704,10 @@ cdef class OrderBook:
         finally:
             self._release()
 
-def bench_insert_cancel(int n=100000):
+def bench_insert_cancel(int n=100000, int levels=200):
     """
     Time n inserts then n cancels entirely inside nogil C code.
+    `levels` = how many distinct price levels per side the orders are spread over.
     Returns (nanoseconds per insert, nanoseconds per cancel).
     """
     cdef Book b
@@ -617,7 +715,7 @@ def bench_insert_cancel(int n=100000):
     cdef int i
     cdef uint64_t seed = 88172645463325252ULL
     cdef int rc = 0
-    if book_init(&b) != BOOK_OK:
+    if book_init(&b, 100) != BOOK_OK:
         raise MemoryError()
     t0 = time.perf_counter_ns()
     with nogil:
@@ -630,10 +728,10 @@ def bench_insert_cancel(int n=100000):
             o.quantity = 100
             if i & 1:
                 o.side = SIDE_BUY
-                o.price = 100.0 - (seed % 200) * 0.01      # bids 98.01 .. 100.00
+                o.price = 50000.0 - (seed % levels) * 0.01   # bids just below 50000.00
             else:
                 o.side = SIDE_SELL
-                o.price = 101.0 + (seed % 200) * 0.01      # asks 101.00 .. 102.99
+                o.price = 50001.0 + (seed % levels) * 0.01   # asks from 50001.00 up
             rc |= book_insert(&b, &o)
     t1 = time.perf_counter_ns()
     with nogil:
@@ -656,7 +754,7 @@ def bench_match(int n=100000):
     cdef Order o
     cdef int i
     cdef int rc = 0
-    if book_init(&b) != BOOK_OK:
+    if book_init(&b, 100) != BOOK_OK:
         raise MemoryError()
     fillbuf_init(&fills)
     o.timestamp_ns = 0
