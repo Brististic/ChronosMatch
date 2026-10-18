@@ -91,3 +91,13 @@ def test_continuous_multi_asset_streaming():
     assert len(batches) >= 2
     for b in batches:
         assert "AAPL" in b and "MSFT" in b
+
+
+def test_market_feed_regime_switching():
+    sim = MarketSimulator(symbols=["AAPL", "MSFT"])
+
+    calm_batch = sim.generate_regime_switching_batch(regime="CALM", batch_size_per_symbol=15)
+    turbulent_batch = sim.generate_regime_switching_batch(regime="TURBULENT", batch_size_per_symbol=15)
+
+    assert len(calm_batch["AAPL"]) == 15
+    assert len(turbulent_batch["AAPL"]) == 30  # Turbulent doubles burst count

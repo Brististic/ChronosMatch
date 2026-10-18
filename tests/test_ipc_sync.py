@@ -82,3 +82,29 @@ def test_multiprocess_pipeline_runner(tmp_path):
         base_dir=str(tmp_path),
     )
     assert res["consumed"] > 0
+
+
+def test_multi_ring_backpressure_and_occupancy(tmp_path):
+    from src.ipc_hub import MultiRingIPCHub
+    from src.schema import pack_order
+
+    symbols = ["AAPL"]
+    hub = MultiRingIPCHub(
+        symbols=symbols,
+        base_dir=str(tmp_path),
+        capacity_per_ring=32,
+        create=True,
+        high_watermark=0.50,
+    )
+
+    now = time.perf_counter_ns()
+    orders = [pack_order(i, b"B", 180.0, 10, now) for i in range(1, 20)]
+
+    written = hub.write_symbol_batch_with_backpressure("AAPL", orders, max_retries=2, backoff_us=10.0)
+    assert written > 0
+
+    occupancy = hub.get_ring_occupancy("AAPL")
+    assert occupancy > 0.0
+
+    hub.close()
+    hub.cleanup_files()

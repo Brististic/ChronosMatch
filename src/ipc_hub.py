@@ -1,4 +1,5 @@
 import os
+import time
 import tempfile
 from typing import Dict, List, Optional
 from src.ring_buffer import MmapRingBuffer
@@ -6,13 +7,21 @@ from src.ipc_sync import MmapProcessLock
 
 
 class MultiRingIPCHub:
-    """Manages dedicated ring buffer and lock pairs per trading symbol to eliminate cross-symbol lock contention."""
+    """Manages dedicated ring buffer and lock pairs per trading symbol with backpressure detection."""
 
-    def __init__(self, symbols: List[str], base_dir: Optional[str] = None, capacity_per_ring: int = 2048, create: bool = True):
+    def __init__(
+        self,
+        symbols: List[str],
+        base_dir: Optional[str] = None,
+        capacity_per_ring: int = 2048,
+        create: bool = True,
+        high_watermark: float = 0.85,
+    ):
         self.symbols = symbols
         self.capacity = capacity_per_ring
         self.base_dir = base_dir or tempfile.gettempdir()
         self.create = create
+        self.high_watermark = high_watermark
 
         self.ring_buffers: Dict[str, MmapRingBuffer] = {}
         self.locks: Dict[str, MmapProcessLock] = {}
@@ -29,11 +38,36 @@ class MultiRingIPCHub:
             self.ring_buffers[sym] = MmapRingBuffer(buf_path, capacity=self.capacity, create=self.create)
             self.locks[sym] = MmapProcessLock(lock_path, create=self.create)
 
-    def write_symbol_batch(self, symbol: str, raw_orders: List[bytes]) -> int:
-        """Writes a batch of orders directly into the symbol-specific ring buffer."""
+    def get_ring_occupancy(self, symbol: str) -> float:
+        """Returns the current buffer fill ratio [0.0, 1.0] for backpressure monitoring."""
+        if symbol not in self.ring_buffers:
+            raise KeyError(f"Unknown symbol: {symbol}")
+        rb = self.ring_buffers[symbol]
+        write_idx, read_idx, capacity, *rest = rb._read_header()
+        occupied = (write_idx - read_idx) % capacity
+        return occupied / float(capacity)
+
+    def write_symbol_batch_with_backpressure(
+        self, symbol: str, raw_orders: List[bytes], max_retries: int = 5, backoff_us: float = 50.0
+    ) -> int:
+        """Writes order batch with adaptive backpressure throttling if buffer exceeds high watermark."""
         if symbol not in self.ring_buffers:
             raise KeyError(f"Unknown symbol: {symbol}")
 
+        for _ in range(max_retries):
+            with self.locks[symbol]:
+                occupancy = self.get_ring_occupancy(symbol)
+                if occupancy < self.high_watermark:
+                    return self.ring_buffers[symbol].write_batch(raw_orders)
+            time.sleep(backoff_us / 1_000_000.0)
+
+        with self.locks[symbol]:
+            return self.ring_buffers[symbol].write_batch(raw_orders)
+
+    def write_symbol_batch(self, symbol: str, raw_orders: List[bytes]) -> int:
+        """Standard direct batch write."""
+        if symbol not in self.ring_buffers:
+            raise KeyError(f"Unknown symbol: {symbol}")
         with self.locks[symbol]:
             return self.ring_buffers[symbol].write_batch(raw_orders)
 
@@ -41,7 +75,6 @@ class MultiRingIPCHub:
         """Reads a batch of orders from the symbol-specific ring buffer."""
         if symbol not in self.ring_buffers:
             raise KeyError(f"Unknown symbol: {symbol}")
-
         with self.locks[symbol]:
             return self.ring_buffers[symbol].read_batch(max_count=max_count)
 

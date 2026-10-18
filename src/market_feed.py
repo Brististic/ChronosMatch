@@ -201,3 +201,23 @@ class MarketSimulator:
                 macro_market_drift=0.0001,
             )
             time.sleep(burst_interval_ms / 1000.0)
+
+
+    def generate_regime_switching_batch(
+        self,
+        regime: str = "CALM",
+        batch_size_per_symbol: int = 30,
+    ) -> Dict[str, List[bytes]]:
+        """Day 10 Member 3: Generates order flow adjusted for CALM vs TURBULENT volatility regimes."""
+        if regime.upper() == "TURBULENT":
+            # Turbulent regime: 4x wider spread spread, aggressive size bursts, and drift
+            return self.generate_correlated_multi_asset_batch(
+                batch_size_per_symbol=batch_size_per_symbol * 2,
+                macro_market_drift=-0.005,
+            )
+        else:
+            # Calm regime: tight spreads and balanced volume
+            return self.generate_correlated_multi_asset_batch(
+                batch_size_per_symbol=batch_size_per_symbol,
+                macro_market_drift=0.0001,
+            )
