@@ -16,3 +16,18 @@ Needs a C++17 compiler: `g++`/`clang++` (Linux/macOS) or MSVC Build Tools (Windo
 | `CHRONOS_ANNOTATE=1` | Writes `.html` annotation reports (find Python C-API calls) |
 | `CHRONOS_NATIVE=1` | Adds `-march=native` (fastest locally, not portable) |
 | `CHRONOS_DEBUG=1` | `-O0 -g`, forces a clean rebuild |
+
+## Reading the ring buffer directly (Day 9)
+```python
+from chronos_engine import OrderBook, RingConsumer
+
+book = OrderBook()
+consumer = RingConsumer(ring_path, lock_path)      # the files MmapRingBuffer / MmapProcessLock use
+summary = consumer.drain_into(book)                # one batch: copy out of the ring, then match
+# summary: messages, submitted, cancels, cancels_missed, rejected, fill_count, filled_quantity,
+#          ring_left, ring_drops, latency_min_ns / latency_max_ns / latency_total_ns
+```
+- Ring layout (Member 1): 24-byte header `<IIIIQ` (head, tail, capacity, slot size, drops), then 29-byte slots.
+- Side `b"B"` / `b"S"` = limit order, `b"C"` = cancel (the order id is the order to cancel).
+- Only the tail field is written, and the ring lock is held only while the slots are copied out.
+- Needs a little-endian machine, which covers Windows, Linux and macOS on x86 and ARM.

@@ -10,6 +10,8 @@ Day 3: price-time priority queue per price level (see price_level.pxd) and
 Day 4: limit order book with insert and cancel (see order_book.pxd) and the
        OrderBook wrapper used to test it from Python.
 Day 5: matching of crossing limit orders (see matching.pxd): OrderBook.submit().
+Day 9: RingConsumer reads orders straight out of the memory-mapped ring buffer (Member 1's
+       layout) into the matching loop - no Python bytes objects, no per-order Python call.
 Day 8: price levels are found through a contiguous table indexed by integer price ticks
        (O(1) lookup instead of binary search); prices are exact integer ticks (price_scale).
 Day 7: partial execution with remainder persistence; every fill carries a trade id and the
@@ -17,9 +19,14 @@ Day 7: partial execution with remainder persistence; every fill carries a trade 
 Day 6: the matching runs in `with nogil:` blocks (GIL released); submit_batch() feeds many
        orders per nogil section; a per-book mutex keeps shared use from threads safe.
 """
+import mmap
+import os
+import sys
 import time
-from libc.stdint cimport int64_t, uint8_t, uint64_t
+from libc.stdint cimport int64_t, uint8_t, uint32_t, uint64_t
 from libc.string cimport memcpy
+from libc.stdlib cimport malloc, free
+from cpython.buffer cimport PyObject_GetBuffer, PyBuffer_Release, PyBUF_WRITABLE
 
 from chronos_engine.order_types cimport (
     Order, OrderNode, WireOrder, SIDE_BUY, SIDE_SELL,
@@ -49,6 +56,26 @@ cdef extern from "<mutex>" namespace "std" nogil:
 
 cdef extern from "Python.h":
     int PyGILState_Check() nogil     # 1 if this thread holds the GIL, else 0 (safe to call without it)
+
+
+cdef extern from *:
+    """
+    #include <atomic>
+    #include <cstdint>
+    static inline uint32_t cm_load_acquire(const unsigned char* p) {
+        return reinterpret_cast<const std::atomic<uint32_t>*>(p)->load(std::memory_order_acquire);
+    }
+    static inline void cm_store_release(unsigned char* p, uint32_t v) {
+        reinterpret_cast<std::atomic<uint32_t>*>(p)->store(v, std::memory_order_release);
+    }
+    static inline int cm_cas(unsigned char* p, uint32_t expected, uint32_t desired) {
+        return reinterpret_cast<std::atomic<uint32_t>*>(p)->compare_exchange_strong(
+            expected, desired, std::memory_order_acq_rel, std::memory_order_acquire) ? 1 : 0;
+    }
+    """
+    uint32_t cm_load_acquire(const unsigned char* p) noexcept nogil
+    void cm_store_release(unsigned char* p, uint32_t v) noexcept nogil
+    int cm_cas(unsigned char* p, uint32_t expected, uint32_t desired) noexcept nogil
 
 
 cdef extern from *:
@@ -780,6 +807,384 @@ def bench_match(int n=100000):
     if rc != 0:
         raise RuntimeError("benchmark operation failed")
     return (t1 - t0) / n
+
+
+# ----------------------------------------------------------------- Day 9 ----
+# Ring buffer file layout written by Member 1's MmapRingBuffer (src/ring_buffer.py):
+#   header  struct "<IIIIQ" = 24 bytes, no padding:
+#       head u32 @0 (producer), tail u32 @4 (consumer), capacity u32 @8, slot_size u32 @12, drops u64 @16
+#   slots   capacity x 29 bytes from offset 24; slot i starts at 24 + i * 29; one slot is always
+#           kept free, so the ring is empty when head == tail
+# Lock file written by MmapProcessLock (src/ipc_sync.py): "<II" = flag u32 @0, owner pid u32 @4.
+cdef enum:
+    RING_HEADER_SIZE = 24
+    RING_OFF_HEAD = 0
+    RING_OFF_TAIL = 4
+    RING_OFF_CAPACITY = 8
+    RING_OFF_SLOT_SIZE = 12
+    RING_OFF_DROPS = 16
+    RING_LOCK_SIZE = 8
+    WIRE_SIDE_CANCEL = 67        # ord('C'): cancel message, order_id = the order to cancel
+
+
+def _pid_alive(int pid):
+    """True if a process with this id exists (used to detect a stale lock left by a dead process)."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle == 0:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True                  # exists, but belongs to another user
+    except OSError:
+        return False
+
+
+cdef int _ring_take(const unsigned char* ring, uint32_t capacity, unsigned char* staging,
+                    uint32_t limit, uint32_t* taken, unsigned long long* drops,
+                    uint32_t* left) noexcept nogil:
+    # Copy up to `limit` slots out of the ring into `staging` and advance the tail.
+    # Only the TAIL field is ever written: head, capacity, slot size and drops belong to the producer.
+    # Returns 0 on success, 1 if the header is corrupt.
+    cdef uint32_t head = cm_load_acquire(ring + RING_OFF_HEAD)      # acquire: slot bytes written before head are visible
+    cdef uint32_t tail = cm_load_acquire(ring + RING_OFF_TAIL)
+    cdef uint32_t available
+    cdef uint32_t n
+    cdef uint32_t first
+    cdef uint32_t slot = sizeof(WireOrder)
+    taken[0] = 0
+    left[0] = 0
+    memcpy(drops, ring + RING_OFF_DROPS, sizeof(unsigned long long))
+    if head >= capacity or tail >= capacity:
+        return 1
+    available = head - tail if head >= tail else capacity - (tail - head)
+    n = available if available < limit else limit
+    if n == 0:
+        return 0
+    first = n if n < capacity - tail else capacity - tail            # slots before the wrap-around
+    memcpy(staging, ring + RING_HEADER_SIZE + <size_t> tail * slot, <size_t> first * slot)
+    if n > first:
+        memcpy(staging + <size_t> first * slot, ring + RING_HEADER_SIZE, <size_t> (n - first) * slot)
+    cm_store_release(<unsigned char*> ring + RING_OFF_TAIL, (tail + n) % capacity)   # release: consumed before slot is freed
+    taken[0] = n
+    left[0] = available - n
+    return 0
+
+
+cdef class RingConsumer:
+    """
+    Reads orders directly out of a memory-mapped ring buffer file and matches them in an
+    OrderBook, with no Python object created per order.
+
+      consumer = RingConsumer(ring_path, lock_path)
+      summary = consumer.drain_into(book)
+
+    One drain: (1) take the ring's lock (the same lock file Member 1's code uses), (2) copy the
+    waiting 29-byte slots into a preallocated C buffer with one or two memcpy calls and advance
+    the tail, (3) release the lock, (4) with the GIL released, decode every slot and submit it
+    (side b'B' / b'S') or cancel it (side b'C'). Producers are only blocked for the short copy.
+    """
+    cdef object _ring_mm
+    cdef object _lock_mm
+    cdef object _ring_fd
+    cdef object _lock_fd
+    cdef Py_buffer _ring_buf
+    cdef Py_buffer _lock_buf
+    cdef bint _ring_held
+    cdef bint _lock_held
+    cdef unsigned char* _ring
+    cdef unsigned char* _lockp
+    cdef unsigned char* _staging
+    cdef uint32_t _capacity
+    cdef uint32_t _max_batch
+    cdef double _spin_timeout
+    cdef int _gil_probe
+    cdef unsigned long long _consumed_total
+
+    def __cinit__(self, ring_path, lock_path=None, unsigned int max_batch=4096,
+                  double spin_timeout_sec=1.0):
+        cdef uint32_t slot_size
+        self._ring_held = False
+        self._lock_held = False
+        self._ring = NULL
+        self._lockp = NULL
+        self._staging = NULL
+        self._gil_probe = -1
+        self._consumed_total = 0
+        if sys.byteorder != "little":
+            raise RuntimeError("RingConsumer needs a little-endian machine (the ring format is little-endian)")
+        if max_batch < 1:
+            raise ValueError("max_batch must be at least 1")
+        if not os.path.exists(ring_path):
+            raise FileNotFoundError("ring buffer file '%s' not found" % ring_path)
+        self._max_batch = max_batch
+        self._spin_timeout = spin_timeout_sec
+        self._ring_fd = os.open(ring_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        self._ring_mm = mmap.mmap(self._ring_fd, 0, access=mmap.ACCESS_WRITE)
+        if PyObject_GetBuffer(self._ring_mm, &self._ring_buf, PyBUF_WRITABLE) != 0:
+            raise ValueError("cannot export the ring mapping as a buffer")
+        self._ring_held = True
+        self._ring = <unsigned char*> self._ring_buf.buf
+        if self._ring_buf.len < RING_HEADER_SIZE:
+            raise ValueError("ring buffer file is too small to hold a header")
+        self._capacity = cm_load_acquire(self._ring + RING_OFF_CAPACITY)
+        slot_size = cm_load_acquire(self._ring + RING_OFF_SLOT_SIZE)
+        if slot_size != sizeof(WireOrder):
+            raise ValueError("ring slot size is %d bytes, the engine expects %d" % (slot_size, sizeof(WireOrder)))
+        if self._capacity < 2 or self._ring_buf.len < RING_HEADER_SIZE + <Py_ssize_t> self._capacity * slot_size:
+            raise ValueError("ring header capacity does not fit the file size")
+        if lock_path is not None:
+            if not os.path.exists(lock_path):
+                raise FileNotFoundError("lock file '%s' not found" % lock_path)
+            self._lock_fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+            self._lock_mm = mmap.mmap(self._lock_fd, RING_LOCK_SIZE, access=mmap.ACCESS_WRITE)
+            if PyObject_GetBuffer(self._lock_mm, &self._lock_buf, PyBUF_WRITABLE) != 0:
+                raise ValueError("cannot export the lock mapping as a buffer")
+            self._lock_held = True
+            self._lockp = <unsigned char*> self._lock_buf.buf
+        self._staging = <unsigned char*> malloc(<size_t> max_batch * sizeof(WireOrder))
+        if self._staging == NULL:
+            raise MemoryError()
+
+    def __dealloc__(self):
+        free(self._staging)
+        self._staging = NULL
+        if self._ring_held:
+            PyBuffer_Release(&self._ring_buf)
+            self._ring_held = False
+        if self._lock_held:
+            PyBuffer_Release(&self._lock_buf)
+            self._lock_held = False
+
+    def close(self):
+        """Release the mappings and files (safe to call twice)."""
+        self._ring = NULL
+        self._lockp = NULL
+        if self._ring_held:
+            PyBuffer_Release(&self._ring_buf)
+            self._ring_held = False
+        if self._lock_held:
+            PyBuffer_Release(&self._lock_buf)
+            self._lock_held = False
+        if self._ring_mm is not None:
+            self._ring_mm.close()
+        if self._lock_mm is not None:
+            self._lock_mm.close()
+        if self._ring_fd is not None:
+            os.close(self._ring_fd)
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+        self._ring_mm = None
+        self._lock_mm = None
+        self._ring_fd = None
+        self._lock_fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    @property
+    def capacity(self):
+        return self._capacity
+
+    @property
+    def slot_size(self):
+        return sizeof(WireOrder)
+
+    @property
+    def max_batch(self):
+        return self._max_batch
+
+    @property
+    def consumed_total(self):
+        """Messages this consumer has taken out of the ring so far."""
+        return self._consumed_total
+
+    @property
+    def gil_held_in_last_drain(self):
+        """1 if the GIL was held while the last drain matched, 0 if released, -1 if none yet."""
+        return self._gil_probe
+
+    cdef int _check_open(self) except -1:
+        if self._ring == NULL:
+            raise ValueError("RingConsumer is closed")
+        return 0
+
+    def pending(self):
+        """Number of messages waiting in the ring right now (not locked: a snapshot)."""
+        cdef uint32_t head
+        cdef uint32_t tail
+        self._check_open()
+        head = cm_load_acquire(self._ring + RING_OFF_HEAD)
+        tail = cm_load_acquire(self._ring + RING_OFF_TAIL)
+        if head >= self._capacity or tail >= self._capacity:
+            raise ValueError("ring header is corrupt (head/tail outside the capacity)")
+        return head - tail if head >= tail else self._capacity - (tail - head)
+
+    def producer_drops(self):
+        """Overrun counter kept by the producer: messages it had to drop because the ring was full."""
+        cdef unsigned long long drops
+        self._check_open()
+        memcpy(&drops, self._ring + RING_OFF_DROPS, sizeof(unsigned long long))
+        return drops
+
+    def _acquire_ring_lock(self):
+        # Same protocol as MmapProcessLock: flag 0 -> 1 (atomic here), then record our pid.
+        cdef int ok
+        cdef uint32_t owner
+        cdef uint32_t pid = os.getpid()
+        deadline = time.perf_counter() + self._spin_timeout
+        while True:
+            with nogil:
+                ok = cm_cas(self._lockp, 0, 1)
+            if ok:
+                cm_store_release(self._lockp + 4, pid)
+                return
+            owner = cm_load_acquire(self._lockp + 4)
+            if owner != 0 and not _pid_alive(<int> owner):
+                cm_store_release(self._lockp + 4, pid)             # stale lock of a dead process: take over
+                return
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("could not acquire the ring lock within %.3f s" % self._spin_timeout)
+            time.sleep(0.0001)
+
+    def _release_ring_lock(self):
+        cm_store_release(self._lockp + 4, 0)
+        cm_store_release(self._lockp, 0)
+
+    def drain_into(self, OrderBook book, unsigned int max_orders=0, bint collect=False):
+        """
+        Take up to max_orders messages (0 = the consumer's max_batch) out of the ring and feed them
+        to `book`. Returns a dict:
+          messages, submitted, cancels, cancels_missed, rejected, fill_count, filled_quantity,
+          fills (list of (taker_id, maker_id, price, quantity) when collect=True, else None),
+          ring_left, ring_drops, latency_min_ns / latency_max_ns / latency_total_ns
+          (time from the order's own timestamp_ns to this drain; same clock as time.perf_counter_ns()).
+        A cancel (side b'C') for an order that is not on the book counts as cancels_missed (normal when
+        the order has already been filled). Invalid or duplicate orders are counted as rejected and skipped.
+        Raises TimeoutError if the ring lock cannot be taken, ValueError if the ring header is corrupt.
+        """
+        cdef uint32_t limit = self._max_batch if (max_orders == 0 or max_orders > self._max_batch) else max_orders
+        cdef uint32_t taken = 0
+        cdef uint32_t left = 0
+        cdef unsigned long long drops = 0
+        cdef int rc = 0
+        cdef int gil_state = -1
+        cdef uint32_t i
+        cdef uint32_t j
+        cdef unsigned long long now_ns
+        cdef unsigned long long lat
+        cdef unsigned long long lat_min = 0
+        cdef unsigned long long lat_max = 0
+        cdef unsigned long long lat_total = 0
+        cdef unsigned long long submitted = 0
+        cdef unsigned long long cancels = 0
+        cdef unsigned long long cancels_missed = 0
+        cdef unsigned long long rejected = 0
+        cdef unsigned long long fill_count = 0
+        cdef unsigned long long filled_quantity = 0
+        cdef int out_of_memory = 0
+        cdef WireOrder wire
+        cdef Order order
+        cdef FillBuffer fills
+        cdef const unsigned char* staging = self._staging
+        cdef unsigned char* ring
+        self._check_open()
+        ring = self._ring
+        # --- phase 1: copy the waiting slots out of the ring (short, under the ring lock) ---
+        if self._lockp != NULL:
+            self._acquire_ring_lock()
+        try:
+            with nogil:
+                rc = _ring_take(ring, self._capacity, self._staging, limit, &taken, &drops, &left)
+        finally:
+            if self._lockp != NULL:
+                self._release_ring_lock()
+        if rc != 0:
+            raise ValueError("ring header is corrupt (head/tail outside the capacity)")
+        self._consumed_total += taken
+        now_ns = time.perf_counter_ns()
+        # --- phase 2: decode and match with the GIL released (under the book's mutex) ---
+        fillbuf_init(&fills)
+        book._acquire()
+        try:
+            with nogil:
+                gil_state = PyGILState_Check()
+                for i in range(taken):
+                    memcpy(&wire, staging + <size_t> i * sizeof(WireOrder), sizeof(WireOrder))
+                    lat = now_ns - wire.timestamp_ns if now_ns >= wire.timestamp_ns else 0
+                    if i == 0 or lat < lat_min:
+                        lat_min = lat
+                    if lat > lat_max:
+                        lat_max = lat
+                    lat_total += lat
+                    if wire.side == WIRE_SIDE_CANCEL:
+                        if book_cancel(&book._book, wire.order_id) == BOOK_OK:
+                            cancels += 1
+                        else:
+                            cancels_missed += 1
+                    else:
+                        order_from_wire(&order, &wire)
+                        rc = book_submit(&book._book, &order, &fills)
+                        if rc == BOOK_ERR_NOMEM:
+                            out_of_memory = 1
+                            break
+                        if rc == BOOK_OK:
+                            submitted += 1
+                        else:
+                            rejected += 1
+                        if not collect:
+                            for j in range(fills.count):
+                                filled_quantity += fills.items[j].quantity
+                            fill_count += fills.count
+                            fillbuf_clear(&fills)
+                if collect:
+                    for j in range(fills.count):
+                        filled_quantity += fills.items[j].quantity
+                    fill_count = fills.count
+            self._gil_probe = gil_state
+            out = None
+            if collect:
+                out = []
+                for j in range(fills.count):
+                    out.append((fills.items[j].taker_id, fills.items[j].maker_id,
+                                fills.items[j].price, fills.items[j].quantity))
+        finally:
+            book._release()
+            fillbuf_free(&fills)
+        if out_of_memory:
+            raise MemoryError()
+        return {"messages": taken, "submitted": submitted, "cancels": cancels,
+                "cancels_missed": cancels_missed, "rejected": rejected,
+                "fill_count": fill_count, "filled_quantity": filled_quantity, "fills": out,
+                "ring_left": left, "ring_drops": drops,
+                "latency_min_ns": lat_min, "latency_max_ns": lat_max, "latency_total_ns": lat_total}
+
+    def drain_all(self, OrderBook book):
+        """Keep draining until the ring is empty. Returns the summed counters (no fill list)."""
+        cdef dict total = {"messages": 0, "submitted": 0, "cancels": 0, "cancels_missed": 0,
+                           "rejected": 0, "fill_count": 0, "filled_quantity": 0, "drains": 0}
+        while True:
+            r = self.drain_into(book)
+            if r["messages"] == 0:
+                break
+            total["drains"] += 1
+            for key in ("messages", "submitted", "cancels", "cancels_missed", "rejected",
+                        "fill_count", "filled_quantity"):
+                total[key] += r[key]
+            total["ring_drops"] = r["ring_drops"]
+        return total
 
 
 def gil_check_demo():
