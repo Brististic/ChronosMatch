@@ -71,3 +71,14 @@ def test_multi_ring_ipc_hub_routing(tmp_path):
 
     hub.close()
     hub.cleanup_files()
+
+
+def test_multiprocess_pipeline_runner(tmp_path):
+    from src.pipeline_runner import run_multiprocess_system
+
+    res = run_multiprocess_system(
+        symbols=["AAPL", "MSFT"],
+        duration_sec=0.5,
+        base_dir=str(tmp_path),
+    )
+    assert res["consumed"] > 0

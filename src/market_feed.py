@@ -185,3 +185,19 @@ class MarketSimulator:
             results[sym] = self.generate_stress_burst(sym, count=batch_size_per_symbol)
 
         return results
+
+
+    def stream_continuous_multi_asset(
+        self,
+        duration_sec: float = 2.0,
+        burst_interval_ms: float = 50.0,
+        batch_size_per_symbol: int = 20,
+    ):
+        """Day 9 Member 3: Yields continuous real-time correlated order bursts across symbols."""
+        start = time.perf_counter()
+        while (time.perf_counter() - start) < duration_sec:
+            yield self.generate_correlated_multi_asset_batch(
+                batch_size_per_symbol=batch_size_per_symbol,
+                macro_market_drift=0.0001,
+            )
+            time.sleep(burst_interval_ms / 1000.0)

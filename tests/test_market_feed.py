@@ -83,3 +83,11 @@ def test_correlated_multi_asset_batch_generation():
 
     assert set(batch.keys()) == {"AAPL", "MSFT", "TSLA"}
     assert all(len(orders) == 25 for orders in batch.values())
+
+
+def test_continuous_multi_asset_streaming():
+    sim = MarketSimulator(symbols=["AAPL", "MSFT"])
+    batches = list(sim.stream_continuous_multi_asset(duration_sec=0.2, burst_interval_ms=20.0, batch_size_per_symbol=10))
+    assert len(batches) >= 2
+    for b in batches:
+        assert "AAPL" in b and "MSFT" in b
