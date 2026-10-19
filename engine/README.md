@@ -31,3 +31,12 @@ summary = consumer.drain_into(book)                # one batch: copy out of the 
 - Side `b"B"` / `b"S"` = limit order, `b"C"` = cancel (the order id is the order to cancel).
 - Only the tail field is written, and the ring lock is held only while the slots are copied out.
 - Needs a little-endian machine, which covers Windows, Linux and macOS on x86 and ARM.
+
+## Validation under load (Day 10)
+```
+python validation/run_match_validation.py              # about 2.5 million messages, writes reports/match_accuracy_report.md
+python validation/run_match_validation.py --scale 0.1  # quick check
+```
+Five stress scenarios are run through the engine on four entry paths (sequential, ring buffer, 4 threads, repeated)
+and compared, fill by fill and order by order, with an independent pure-Python reference engine.
+The command exits with status 0 only if every check passes.
