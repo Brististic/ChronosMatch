@@ -1,3 +1,4 @@
+import argparse
 import curses
 import random
 import struct
@@ -5,12 +6,16 @@ import threading
 import time
 from collections import deque, namedtuple
 
+VERSION = "0.1.0"
+
+# Defaults. The launch flags below can override the first three at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
-WORKER_SLEEP = 0.001   # engine consumer loop pause
 LEVELS = 5             # price levels shown per side
+TARGET_OPS = 100_000   # target throughput from the project plan
+
+WORKER_SLEEP = 0.001   # engine consumer loop pause
 TICK = 0.01            # price step between levels
 MAX_QTY = 2000
-TARGET_OPS = 100_000   # target throughput from the project plan
 FILL_BUFFER = 500      # how many recent fills the UI keeps
 LATENCY_BUFFER = 5000  # how many latency samples are kept
 
@@ -28,6 +33,97 @@ Snapshot = namedtuple(
     "Snapshot", "book rate peak total fills fill_total latency polls"
 )
 
+
+# ---------------------------------------------------------------- CLI
+
+def bounded_int(lo, hi):
+    """argparse type: a whole number between lo and hi."""
+    def check(text):
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+        if not lo <= value <= hi:
+            raise argparse.ArgumentTypeError(
+                f"must be between {lo} and {hi}, got {value}"
+            )
+        return value
+    return check
+
+
+def positive_float(text):
+    """argparse type: a number greater than zero."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return value
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="dashboard.py",
+        description="ChronosMatch live latency dashboard (curses terminal UI).",
+        epilog=(
+            "examples:\n"
+            "  python3 ui/dashboard.py\n"
+            "  python3 ui/dashboard.py --levels 8 --refresh-ms 50\n"
+            "  python3 ui/dashboard.py --seed 42 --duration 30\n"
+            "\n"
+            "keys while running:\n"
+            "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-s", "--source", choices=["mock"], default="mock",
+        help="data source (only 'mock' for now; the real engine is added "
+             "at integration)",
+    )
+    parser.add_argument(
+        "-r", "--refresh-ms", type=bounded_int(20, 1000), default=REFRESH_MS,
+        metavar="MS", help=f"screen refresh interval in ms (default {REFRESH_MS})",
+    )
+    parser.add_argument(
+        "-l", "--levels", type=bounded_int(1, 10), default=LEVELS,
+        metavar="N", help=f"price levels per side in the ladder (default {LEVELS})",
+    )
+    parser.add_argument(
+        "-t", "--target-ops", type=bounded_int(1, 10_000_000),
+        default=TARGET_OPS, metavar="N",
+        help=f"target orders/sec for the throughput bar (default {TARGET_OPS})",
+    )
+    parser.add_argument(
+        "-m", "--mid-price", type=positive_float, default=150.0, metavar="PRICE",
+        help="starting price of the mock market (default 150.0)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="fixed random seed so a mock run is repeatable",
+    )
+    parser.add_argument(
+        "-d", "--duration", type=positive_float, default=None, metavar="SECONDS",
+        help="quit automatically after this many seconds (default: run until q)",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {VERSION}",
+    )
+    return parser
+
+
+def apply_args(args):
+    """Copy the launch options into the module settings the UI reads."""
+    global REFRESH_MS, LEVELS, TARGET_OPS
+    REFRESH_MS = args.refresh_ms
+    LEVELS = args.levels
+    TARGET_OPS = args.target_ops
+    if args.seed is not None:
+        random.seed(args.seed)
+
+
+# --------------------------------------------------------- mock engine
 
 class MockOrderBook:
     """Fake multi-level book. Lives inside the mock stream below."""
@@ -92,8 +188,8 @@ class MockEngineStream:
       - book   -> object with .bids and .asks (lists of (price, qty))
     """
 
-    def __init__(self):
-        self.book = MockOrderBook()
+    def __init__(self, mid=150.00):
+        self.book = MockOrderBook(mid)
         self.last = time.perf_counter()
         self.next_id = 1
 
@@ -118,6 +214,13 @@ class MockEngineStream:
         if random.random() < 0.01:
             latency_us *= 3
         return n_orders, raw, latency_us
+
+
+def make_stream(args):
+    """Create the data source chosen with --source."""
+    if args.source == "mock":
+        return MockEngineStream(args.mid_price)
+    raise ValueError(f"unknown source: {args.source}")
 
 
 class EngineReader:
@@ -253,6 +356,8 @@ class LogView:
         self.follow = True
 
 
+# ------------------------------------------------------------ drawing
+
 def put(win, y, x, text, attr=0):
     """addstr that never crashes or wraps if the window is too small."""
     try:
@@ -335,7 +440,7 @@ def draw_metrics(win, snap):
     put(win, 3, 2, f"{'Peak':<12}{snap.peak:>14,.0f}")
     put(win, 4, 2, f"{'Total':<12}{snap.total:>14,}")
 
-    # throughput bar relative to the 100k target
+    # throughput bar relative to the target
     bar_w = max(0, w - 6)
     filled = min(bar_w, int(snap.rate / TARGET_OPS * bar_w))
     put(win, 6, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]")
@@ -432,7 +537,9 @@ def handle_resize(stdscr):
     return build_windows(stdscr), stdscr.getmaxyx()
 
 
-def main(stdscr):
+# --------------------------------------------------------------- main
+
+def main(stdscr, args):
     curses.curs_set(0)
     stdscr.timeout(REFRESH_MS)
 
@@ -440,12 +547,14 @@ def main(stdscr):
     wins = build_windows(stdscr)
     view = LogView()
 
-    worker = EngineWorker(EngineReader(MockEngineStream()))  # swap in the real stream later
+    worker = EngineWorker(EngineReader(make_stream(args)))
     worker.start()
 
     fps = 0.0
     poll_rate = 0.0
-    last_t = time.perf_counter()
+    snap = None
+    start_t = time.perf_counter()
+    last_t = start_t
     last_polls = 0
 
     try:
@@ -468,6 +577,9 @@ def main(stdscr):
                 stats_text = f"UI {fps:4.1f} fps | engine {poll_rate:,.0f} polls/s"
                 draw(wins, snap, view, stats_text)
 
+            if args.duration is not None and now - start_t >= args.duration:
+                break
+
             key = stdscr.getch()
             if key in (ord("q"), ord("Q")):
                 break
@@ -487,10 +599,17 @@ def main(stdscr):
     finally:
         worker.stop()
 
-    return worker.error
+    return worker.error, snap
 
 
 if __name__ == "__main__":
-    error = curses.wrapper(main)
+    args = build_parser().parse_args()
+    apply_args(args)
+    error, last = curses.wrapper(main, args)
     if error:
         raise error
+    if last:
+        print(
+            f"Session ended: {last.total:,} orders processed, "
+            f"peak {last.peak:,.0f} orders/sec, {last.fill_total:,} fills"
+        )
