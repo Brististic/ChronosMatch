@@ -101,3 +101,13 @@ def test_market_feed_regime_switching():
 
     assert len(calm_batch["AAPL"]) == 15
     assert len(turbulent_batch["AAPL"]) == 30  # Turbulent doubles burst count
+
+
+def test_jittered_packet_generation():
+    sim = MarketSimulator(symbols=["AAPL"])
+    jittered = sim.generate_jittered_burst("AAPL", count=25, max_jitter_us=100.0, reorder_probability=0.3)
+
+    assert len(jittered) == 25
+    timestamps = [unpack_order(p).timestamp_ns for p in jittered]
+    # Check that timestamps have microsecond dispersion
+    assert len(set(timestamps)) > 1

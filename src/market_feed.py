@@ -3,7 +3,7 @@ import math
 import random
 import time
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
-from src.schema import pack_order
+from src.schema import pack_order, unpack_order
 
 
 class MarketSimulator:
@@ -221,3 +221,31 @@ class MarketSimulator:
                 batch_size_per_symbol=batch_size_per_symbol,
                 macro_market_drift=0.0001,
             )
+
+
+    def generate_jittered_burst(
+        self,
+        symbol: str,
+        count: int = 30,
+        max_jitter_us: float = 150.0,
+        reorder_probability: float = 0.20,
+    ) -> List[bytes]:
+        """Day 11 Member 3: Generates order flow with randomized network latency jitter and packet reordering."""
+        raw_burst = self.generate_stress_burst(symbol, count=count)
+        now_ns = time.perf_counter_ns()
+
+        jittered_orders = []
+        for i, pkt in enumerate(raw_burst):
+            order = unpack_order(pkt)
+            # Apply microsecond network delay jitter to transmission timestamp
+            jitter_ns = int(random.uniform(10.0, max_jitter_us) * 1000.0)
+            adjusted_ts = now_ns - jitter_ns
+            jittered_orders.append(pack_order(order.order_id, order.side, order.price, order.quantity, adjusted_ts))
+
+        # Simulate out-of-order packet arrival on wire
+        if count > 3 and reorder_probability > 0:
+            for j in range(len(jittered_orders) - 1):
+                if random.random() < reorder_probability:
+                    jittered_orders[j], jittered_orders[j + 1] = jittered_orders[j + 1], jittered_orders[j]
+
+        return jittered_orders

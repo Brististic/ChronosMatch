@@ -108,3 +108,41 @@ def test_multi_ring_backpressure_and_occupancy(tmp_path):
 
     hub.close()
     hub.cleanup_files()
+
+
+def test_snapshot_checkpoint_and_recovery(tmp_path):
+    from src.snapshot_manager import SnapshotManager
+    from src.ring_buffer import MmapRingBuffer
+    from src.ipc_sync import MmapProcessLock
+    from src.schema import pack_order
+
+    buf_path = str(tmp_path / "snap_test.bin")
+    lock_path = str(tmp_path / "snap_test.lock")
+    snap_dir = str(tmp_path / "snapshots")
+
+    rb = MmapRingBuffer(buf_path, capacity=64, create=True)
+    lock = MmapProcessLock(lock_path, create=True)
+    mgr = SnapshotManager(snap_dir)
+
+    now = time.perf_counter_ns()
+    pkts = [pack_order(i, b"B", 100.0 + i, 10, now) for i in range(1, 11)]
+    rb.write_batch(pkts)
+
+    # Capture state snapshot
+    snap = mgr.capture_channel_snapshot("AAPL", rb, lock, engine_stats={"total_matches": 5})
+    assert snap["write_idx"] == 10
+    assert snap["unconsumed_count"] == 10
+
+    # Simulate crash/header corruption by resetting indices with exact 5 arguments: (head, tail, capacity, slot_size, drops)
+    with lock:
+        rb._write_header(0, 0, 64, rb.slot_size, 0)
+
+    # Recover state from snapshot
+    recovered = mgr.recover_ring_offsets("AAPL", rb, lock)
+    assert recovered is True
+
+    hdr = rb._read_header()
+    assert hdr[0] == 10  # write_idx (head) recovered back to 10
+
+    rb.close()
+    lock.close()
