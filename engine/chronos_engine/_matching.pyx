@@ -24,7 +24,7 @@ import os
 import sys
 import time
 from libc.stdint cimport int64_t, uint8_t, uint32_t, uint64_t
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memset
 from libc.stdlib cimport malloc, free
 from cpython.buffer cimport PyObject_GetBuffer, PyBuffer_Release, PyBUF_WRITABLE
 
@@ -76,6 +76,19 @@ cdef extern from *:
     uint32_t cm_load_acquire(const unsigned char* p) noexcept nogil
     void cm_store_release(unsigned char* p, uint32_t v) noexcept nogil
     int cm_cas(unsigned char* p, uint32_t expected, uint32_t desired) noexcept nogil
+
+
+cdef extern from *:
+    """
+    #ifdef _WIN32
+    #include <process.h>
+    static inline unsigned int cm_getpid() { return (unsigned int) _getpid(); }
+    #else
+    #include <unistd.h>
+    static inline unsigned int cm_getpid() { return (unsigned int) getpid(); }
+    #endif
+    """
+    uint32_t cm_getpid() noexcept nogil
 
 
 cdef extern from *:
@@ -880,18 +893,38 @@ cdef int _ring_take(const unsigned char* ring, uint32_t capacity, unsigned char*
     return 0
 
 
+cdef struct DrainStats:
+    uint32_t messages           # slots taken out of the ring by this drain
+    uint32_t left               # slots still waiting afterwards
+    unsigned long long submitted
+    unsigned long long cancels
+    unsigned long long cancels_missed
+    unsigned long long rejected
+    unsigned long long fill_count
+    unsigned long long filled_quantity
+    unsigned long long lat_min
+    unsigned long long lat_max
+    unsigned long long lat_total
+    unsigned long long drops    # the producer's overrun counter, as read from the header
+
+
 cdef class RingConsumer:
     """
     Reads orders directly out of a memory-mapped ring buffer file and matches them in an
     OrderBook, with no Python object created per order.
 
       consumer = RingConsumer(ring_path, lock_path)
-      summary = consumer.drain_into(book)
+      summary = consumer.drain_into(book)          # returns a dict of counters
+      n = consumer.drain(book)                     # lean: returns only the message count
 
-    One drain: (1) take the ring's lock (the same lock file Member 1's code uses), (2) copy the
-    waiting 29-byte slots into a preallocated C buffer with one or two memcpy calls and advance
-    the tail, (3) release the lock, (4) with the GIL released, decode every slot and submit it
-    (side b'B' / b'S') or cancel it (side b'C'). Producers are only blocked for the short copy.
+    One drain, all in ONE section without the GIL (Day 11): take the ring's lock (the same lock file
+    Member 1's code uses; one atomic compare-and-swap when it is free), copy the waiting 29-byte slots
+    into a preallocated C buffer, advance the tail and release the lock, then decode every slot and
+    submit it (side b'B' / b'S') or cancel it (side b'C') under the book's mutex.
+    Producers are only blocked for the short copy.
+
+    track_latency=True (default) reads time.perf_counter_ns() once per drain so the summary can report
+    how long orders waited; track_latency=False skips that one Python call for the lowest overhead.
     """
     cdef object _ring_mm
     cdef object _lock_mm
@@ -907,11 +940,15 @@ cdef class RingConsumer:
     cdef uint32_t _capacity
     cdef uint32_t _max_batch
     cdef double _spin_timeout
+    cdef bint _track_latency
     cdef int _gil_probe
     cdef unsigned long long _consumed_total
+    cdef FillBuffer _fills            # reused by every drain (cleared, never reallocated unless it must grow)
+    cdef DrainStats _tot              # running totals for drain()/totals()
+    cdef unsigned long long _tot_drains
 
     def __cinit__(self, ring_path, lock_path=None, unsigned int max_batch=4096,
-                  double spin_timeout_sec=1.0):
+                  double spin_timeout_sec=1.0, bint track_latency=True):
         cdef uint32_t slot_size
         self._ring_held = False
         self._lock_held = False
@@ -920,6 +957,10 @@ cdef class RingConsumer:
         self._staging = NULL
         self._gil_probe = -1
         self._consumed_total = 0
+        self._tot_drains = 0
+        self._track_latency = track_latency
+        memset(&self._tot, 0, sizeof(DrainStats))
+        fillbuf_init(&self._fills)
         if sys.byteorder != "little":
             raise RuntimeError("RingConsumer needs a little-endian machine (the ring format is little-endian)")
         if max_batch < 1:
@@ -958,6 +999,7 @@ cdef class RingConsumer:
     def __dealloc__(self):
         free(self._staging)
         self._staging = NULL
+        fillbuf_free(&self._fills)
         if self._ring_held:
             PyBuffer_Release(&self._ring_buf)
             self._ring_held = False
@@ -1039,29 +1081,115 @@ cdef class RingConsumer:
         memcpy(&drops, self._ring + RING_OFF_DROPS, sizeof(unsigned long long))
         return drops
 
-    def _acquire_ring_lock(self):
-        # Same protocol as MmapProcessLock: flag 0 -> 1 (atomic here), then record our pid.
-        cdef int ok
+    cdef bint _try_lock(self) noexcept nogil:
+        # Fast path, pure C: atomic compare-and-swap of the flag 0 -> 1, then record our pid.
+        if cm_cas(self._lockp, 0, 1):
+            cm_store_release(self._lockp + 4, cm_getpid())
+            return True
+        return False
+
+    cdef int _acquire_lock_slow(self) except -1:
+        # Slow path (the lock is busy): same protocol as MmapProcessLock, with a time-out and
+        # take-over of a lock left behind by a process that no longer exists.
         cdef uint32_t owner
-        cdef uint32_t pid = os.getpid()
         deadline = time.perf_counter() + self._spin_timeout
         while True:
-            with nogil:
-                ok = cm_cas(self._lockp, 0, 1)
-            if ok:
-                cm_store_release(self._lockp + 4, pid)
-                return
+            if self._try_lock():
+                return 0
             owner = cm_load_acquire(self._lockp + 4)
             if owner != 0 and not _pid_alive(<int> owner):
-                cm_store_release(self._lockp + 4, pid)             # stale lock of a dead process: take over
-                return
+                cm_store_release(self._lockp + 4, cm_getpid())     # stale lock of a dead process: take over
+                return 0
             if time.perf_counter() >= deadline:
                 raise TimeoutError("could not acquire the ring lock within %.3f s" % self._spin_timeout)
             time.sleep(0.0001)
 
-    def _release_ring_lock(self):
-        cm_store_release(self._lockp + 4, 0)
-        cm_store_release(self._lockp, 0)
+    cdef int _drain_core(self, OrderBook book, uint32_t limit, bint collect, DrainStats* st) except -1:
+        # One complete drain. No Python object is created, no Python function is called (except the
+        # optional once-per-drain clock read and the slow lock path). The ring lock is released as soon
+        # as the slots are copied; matching then runs under the book's mutex.
+        cdef int rc = 0
+        cdef int gil_state = -1
+        cdef int out_of_memory = 0
+        cdef uint32_t i
+        cdef uint32_t j
+        cdef unsigned long long now_ns = 0
+        cdef unsigned long long lat
+        cdef WireOrder wire
+        cdef Order order
+        cdef const unsigned char* staging = self._staging
+        cdef unsigned char* ring = self._ring
+        cdef uint32_t capacity = self._capacity
+        cdef unsigned char* lockp = self._lockp
+        cdef uint32_t head
+        cdef uint32_t tail
+        cdef FillBuffer* fills = &self._fills
+        cdef bint track = self._track_latency
+        memset(st, 0, sizeof(DrainStats))
+        self._check_open()
+        # Empty ring: look at head and tail WITHOUT the lock and return at once. A polling loop on a quiet
+        # market then never touches the lock, so it cannot get in the producer's way. (A corrupt header is
+        # not treated as empty; it goes on to the normal path, which reports it.)
+        fillbuf_clear(fills)                                # fills of the PREVIOUS drain must never be reported again
+        head = cm_load_acquire(ring + RING_OFF_HEAD)
+        tail = cm_load_acquire(ring + RING_OFF_TAIL)
+        if head == tail and head < capacity:
+            memcpy(&st.drops, ring + RING_OFF_DROPS, sizeof(unsigned long long))
+            return 0
+        if track:
+            now_ns = time.perf_counter_ns()
+        if lockp != NULL and not self._try_lock():
+            self._acquire_lock_slow()
+        with nogil:
+            gil_state = PyGILState_Check()                  # once per drain: proves this section runs without the GIL
+            rc = _ring_take(ring, capacity, self._staging, limit, &st.messages, &st.drops, &st.left)
+            if lockp != NULL:                               # release the ring lock before matching
+                cm_store_release(lockp + 4, 0)
+                cm_store_release(lockp, 0)
+            if rc == 0 and st.messages > 0:
+                book._lock.lock()
+                for i in range(st.messages):
+                    memcpy(&wire, staging + <size_t> i * sizeof(WireOrder), sizeof(WireOrder))
+                    if track:
+                        lat = now_ns - wire.timestamp_ns if now_ns >= wire.timestamp_ns else 0
+                        if i == 0 or lat < st.lat_min:
+                            st.lat_min = lat
+                        if lat > st.lat_max:
+                            st.lat_max = lat
+                        st.lat_total += lat
+                    if wire.side == WIRE_SIDE_CANCEL:
+                        if book_cancel(&book._book, wire.order_id) == BOOK_OK:
+                            st.cancels += 1
+                        else:
+                            st.cancels_missed += 1
+                    else:
+                        order_from_wire(&order, &wire)
+                        rc = book_submit(&book._book, &order, fills)
+                        if rc == BOOK_ERR_NOMEM:
+                            out_of_memory = 1
+                            break
+                        if rc == BOOK_OK:
+                            st.submitted += 1
+                        else:
+                            st.rejected += 1
+                        if not collect:
+                            for j in range(fills.count):
+                                st.filled_quantity += fills.items[j].quantity
+                            st.fill_count += fills.count
+                            fillbuf_clear(fills)
+                if collect:
+                    for j in range(fills.count):
+                        st.filled_quantity += fills.items[j].quantity
+                    st.fill_count = fills.count
+                book._lock.unlock()
+        self._gil_probe = gil_state
+        if rc == 1 and st.messages == 0 and st.left == 0 and not out_of_memory:
+            # _ring_take reports a corrupt header with rc == 1 (nothing was taken)
+            raise ValueError("ring header is corrupt (head/tail outside the capacity)")
+        if out_of_memory:
+            raise MemoryError()
+        self._consumed_total += st.messages
+        return 0
 
     def drain_into(self, OrderBook book, unsigned int max_orders=0, bint collect=False):
         """
@@ -1070,106 +1198,63 @@ cdef class RingConsumer:
           messages, submitted, cancels, cancels_missed, rejected, fill_count, filled_quantity,
           fills (list of (taker_id, maker_id, price, quantity) when collect=True, else None),
           ring_left, ring_drops, latency_min_ns / latency_max_ns / latency_total_ns
-          (time from the order's own timestamp_ns to this drain; same clock as time.perf_counter_ns()).
+          (time from the order's own timestamp_ns to the start of this drain; same clock as
+          time.perf_counter_ns(); all 0 when the consumer was made with track_latency=False).
         A cancel (side b'C') for an order that is not on the book counts as cancels_missed (normal when
         the order has already been filled). Invalid or duplicate orders are counted as rejected and skipped.
         Raises TimeoutError if the ring lock cannot be taken, ValueError if the ring header is corrupt.
         """
         cdef uint32_t limit = self._max_batch if (max_orders == 0 or max_orders > self._max_batch) else max_orders
-        cdef uint32_t taken = 0
-        cdef uint32_t left = 0
-        cdef unsigned long long drops = 0
-        cdef int rc = 0
-        cdef int gil_state = -1
-        cdef uint32_t i
+        cdef DrainStats st
         cdef uint32_t j
-        cdef unsigned long long now_ns
-        cdef unsigned long long lat
-        cdef unsigned long long lat_min = 0
-        cdef unsigned long long lat_max = 0
-        cdef unsigned long long lat_total = 0
-        cdef unsigned long long submitted = 0
-        cdef unsigned long long cancels = 0
-        cdef unsigned long long cancels_missed = 0
-        cdef unsigned long long rejected = 0
-        cdef unsigned long long fill_count = 0
-        cdef unsigned long long filled_quantity = 0
-        cdef int out_of_memory = 0
-        cdef WireOrder wire
-        cdef Order order
-        cdef FillBuffer fills
-        cdef const unsigned char* staging = self._staging
-        cdef unsigned char* ring
-        self._check_open()
-        ring = self._ring
-        # --- phase 1: copy the waiting slots out of the ring (short, under the ring lock) ---
-        if self._lockp != NULL:
-            self._acquire_ring_lock()
-        try:
-            with nogil:
-                rc = _ring_take(ring, self._capacity, self._staging, limit, &taken, &drops, &left)
-        finally:
-            if self._lockp != NULL:
-                self._release_ring_lock()
-        if rc != 0:
-            raise ValueError("ring header is corrupt (head/tail outside the capacity)")
-        self._consumed_total += taken
-        now_ns = time.perf_counter_ns()
-        # --- phase 2: decode and match with the GIL released (under the book's mutex) ---
-        fillbuf_init(&fills)
-        book._acquire()
-        try:
-            with nogil:
-                gil_state = PyGILState_Check()
-                for i in range(taken):
-                    memcpy(&wire, staging + <size_t> i * sizeof(WireOrder), sizeof(WireOrder))
-                    lat = now_ns - wire.timestamp_ns if now_ns >= wire.timestamp_ns else 0
-                    if i == 0 or lat < lat_min:
-                        lat_min = lat
-                    if lat > lat_max:
-                        lat_max = lat
-                    lat_total += lat
-                    if wire.side == WIRE_SIDE_CANCEL:
-                        if book_cancel(&book._book, wire.order_id) == BOOK_OK:
-                            cancels += 1
-                        else:
-                            cancels_missed += 1
-                    else:
-                        order_from_wire(&order, &wire)
-                        rc = book_submit(&book._book, &order, &fills)
-                        if rc == BOOK_ERR_NOMEM:
-                            out_of_memory = 1
-                            break
-                        if rc == BOOK_OK:
-                            submitted += 1
-                        else:
-                            rejected += 1
-                        if not collect:
-                            for j in range(fills.count):
-                                filled_quantity += fills.items[j].quantity
-                            fill_count += fills.count
-                            fillbuf_clear(&fills)
-                if collect:
-                    for j in range(fills.count):
-                        filled_quantity += fills.items[j].quantity
-                    fill_count = fills.count
-            self._gil_probe = gil_state
-            out = None
-            if collect:
-                out = []
-                for j in range(fills.count):
-                    out.append((fills.items[j].taker_id, fills.items[j].maker_id,
-                                fills.items[j].price, fills.items[j].quantity))
-        finally:
-            book._release()
-            fillbuf_free(&fills)
-        if out_of_memory:
-            raise MemoryError()
-        return {"messages": taken, "submitted": submitted, "cancels": cancels,
-                "cancels_missed": cancels_missed, "rejected": rejected,
-                "fill_count": fill_count, "filled_quantity": filled_quantity, "fills": out,
-                "ring_left": left, "ring_drops": drops,
-                "latency_min_ns": lat_min, "latency_max_ns": lat_max, "latency_total_ns": lat_total}
+        self._drain_core(book, limit, collect, &st)
+        out = None
+        if collect:
+            out = []
+            for j in range(self._fills.count):
+                out.append((self._fills.items[j].taker_id, self._fills.items[j].maker_id,
+                            self._fills.items[j].price, self._fills.items[j].quantity))
+        return {"messages": st.messages, "submitted": st.submitted, "cancels": st.cancels,
+                "cancels_missed": st.cancels_missed, "rejected": st.rejected,
+                "fill_count": st.fill_count, "filled_quantity": st.filled_quantity, "fills": out,
+                "ring_left": st.left, "ring_drops": st.drops,
+                "latency_min_ns": st.lat_min, "latency_max_ns": st.lat_max, "latency_total_ns": st.lat_total}
+
+    def drain(self, OrderBook book, unsigned int max_orders=0):
+        """
+        Lean version of drain_into(): takes up to max_orders messages out of the ring, matches them,
+        adds the counters to the running totals (see totals()) and returns only the number of messages
+        taken. No dict and no list is built, so a polling loop pays almost nothing per call.
+        """
+        cdef uint32_t limit = self._max_batch if (max_orders == 0 or max_orders > self._max_batch) else max_orders
+        cdef DrainStats st
+        self._drain_core(book, limit, False, &st)
+        if st.messages > 0:
+            self._tot_drains += 1
+            self._tot.messages += st.messages
+            self._tot.submitted += st.submitted
+            self._tot.cancels += st.cancels
+            self._tot.cancels_missed += st.cancels_missed
+            self._tot.rejected += st.rejected
+            self._tot.fill_count += st.fill_count
+            self._tot.filled_quantity += st.filled_quantity
+            if self._tot.lat_total == 0 and self._tot.lat_max == 0 or st.lat_min < self._tot.lat_min:
+                self._tot.lat_min = st.lat_min
+            if st.lat_max > self._tot.lat_max:
+                self._tot.lat_max = st.lat_max
+            self._tot.lat_total += st.lat_total
+        self._tot.left = st.left
+        self._tot.drops = st.drops
+        return st.messages
+
+    def totals(self):
+        """Running totals of everything taken by drain() (drain_into() is not added to them)."""
+        return {"drains": self._tot_drains, "messages": self._tot.messages, "submitted": self._tot.submitted,
+                "cancels": self._tot.cancels, "cancels_missed": self._tot.cancels_missed,
+                "rejected": self._tot.rejected, "fill_count": self._tot.fill_count,
+                "filled_quantity": self._tot.filled_quantity, "ring_left": self._tot.left,
+                "ring_drops": self._tot.drops, "latency_min_ns": self._tot.lat_min,
+                "latency_max_ns": self._tot.lat_max, "latency_total_ns": self._tot.lat_total}
 
     def drain_all(self, OrderBook book):
         """Keep draining until the ring is empty. Returns the summed counters (no fill list)."""

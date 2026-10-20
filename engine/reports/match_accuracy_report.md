@@ -1,8 +1,8 @@
 # ChronosMatch - Match Accuracy and Determinism Validation Report
 
-**Component:** Cython matching engine (`chronos_engine` 0.9.0)  
+**Component:** Cython matching engine (`chronos_engine` 0.10.0)  
 **Author:** Member 2 (Core Quant Engine Engineer)  
-**Generated:** 2026-10-19 01:58:47 UTC by `validation/run_match_validation.py` (scale 1.00)
+**Generated:** 2026-10-20 11:26:37 UTC by `validation/run_match_validation.py` (scale 1.00)
 
 ## Verdict: PASS - all 75 checks passed
 
@@ -15,8 +15,8 @@
 | Python | 3.12.3 (CPython) |
 | Operating system | Linux-6.18.44-fc-v139-x86_64-with-glibc2.39 |
 | CPU | Intel(R) Xeon(R) Processor @ 2.10GHz (1 logical cores) |
-| Engine version | 0.9.0 |
-| Run time | 32 s |
+| Engine version | 0.10.0 |
+| Run time | 35 s |
 
 ## Method
 
@@ -46,14 +46,14 @@
 
 | Entry path | Fills | Fill fingerprint | Book fingerprint | Matches oracle | Time | Rate |
 |---|---:|---|---|---|---:|---:|
-| oracle (pure Python) | 758,892 | `56e70df9fc90...` | `8d334497a400...` | reference | 1.8 s | 0.54 M/s |
-| engine, sequential submit/cancel (run 1) | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 1.5 s | 0.66 M/s |
-| engine, sequential submit/cancel (run 2) | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 1.3 s | 0.77 M/s |
-| engine, mmap ring buffer + RingConsumer | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 0.6 s | 1.63 M/s |
-| engine, 4 threads on separate books #1 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.7 s | 0.60 M/s |
-| engine, 4 threads on separate books #2 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.7 s | 0.60 M/s |
-| engine, 4 threads on separate books #3 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.7 s | 0.60 M/s |
-| engine, 4 threads on separate books #4 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.7 s | 0.60 M/s |
+| oracle (pure Python) | 758,892 | `56e70df9fc90...` | `8d334497a400...` | reference | 1.7 s | 0.59 M/s |
+| engine, sequential submit/cancel (run 1) | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 1.4 s | 0.74 M/s |
+| engine, sequential submit/cancel (run 2) | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 1.4 s | 0.73 M/s |
+| engine, mmap ring buffer + RingConsumer | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 0.8 s | 1.26 M/s |
+| engine, 4 threads on separate books #1 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.8 s | 0.59 M/s |
+| engine, 4 threads on separate books #2 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.8 s | 0.59 M/s |
+| engine, 4 threads on separate books #3 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.8 s | 0.59 M/s |
+| engine, 4 threads on separate books #4 | 758,892 | `56e70df9fc90...` | `8d334497a400...` | yes | 6.8 s | 0.59 M/s |
 
 | Check | Result |
 |---|---|
@@ -83,14 +83,14 @@
 
 | Entry path | Fills | Fill fingerprint | Book fingerprint | Matches oracle | Time | Rate |
 |---|---:|---|---|---|---:|---:|
-| oracle (pure Python) | 426,142 | `d136b1159957...` | `42599b658c78...` | reference | 0.9 s | 0.58 M/s |
-| engine, sequential submit/cancel (run 1) | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 0.6 s | 0.78 M/s |
-| engine, sequential submit/cancel (run 2) | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 0.7 s | 0.74 M/s |
-| engine, mmap ring buffer + RingConsumer | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 0.3 s | 1.71 M/s |
-| engine, 4 threads on separate books #1 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 2.8 s | 0.70 M/s |
-| engine, 4 threads on separate books #2 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 2.8 s | 0.70 M/s |
-| engine, 4 threads on separate books #3 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 2.8 s | 0.70 M/s |
-| engine, 4 threads on separate books #4 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 2.8 s | 0.70 M/s |
+| oracle (pure Python) | 426,142 | `d136b1159957...` | `42599b658c78...` | reference | 0.9 s | 0.56 M/s |
+| engine, sequential submit/cancel (run 1) | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 0.9 s | 0.57 M/s |
+| engine, sequential submit/cancel (run 2) | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 0.8 s | 0.67 M/s |
+| engine, mmap ring buffer + RingConsumer | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 0.4 s | 1.43 M/s |
+| engine, 4 threads on separate books #1 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 3.2 s | 0.62 M/s |
+| engine, 4 threads on separate books #2 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 3.2 s | 0.62 M/s |
+| engine, 4 threads on separate books #3 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 3.2 s | 0.62 M/s |
+| engine, 4 threads on separate books #4 | 426,142 | `d136b1159957...` | `42599b658c78...` | yes | 3.2 s | 0.62 M/s |
 
 | Check | Result |
 |---|---|
@@ -120,14 +120,14 @@
 
 | Entry path | Fills | Fill fingerprint | Book fingerprint | Matches oracle | Time | Rate |
 |---|---:|---|---|---|---:|---:|
-| oracle (pure Python) | 81,563 | `35599f72871a...` | `aa7641d15b71...` | reference | 0.2 s | 1.21 M/s |
-| engine, sequential submit/cancel (run 1) | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.2 s | 1.51 M/s |
-| engine, sequential submit/cancel (run 2) | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.2 s | 1.51 M/s |
-| engine, mmap ring buffer + RingConsumer | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.1 s | 4.75 M/s |
-| engine, 4 threads on separate books #1 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.51 M/s |
-| engine, 4 threads on separate books #2 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.51 M/s |
-| engine, 4 threads on separate books #3 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.51 M/s |
-| engine, 4 threads on separate books #4 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.51 M/s |
+| oracle (pure Python) | 81,563 | `35599f72871a...` | `aa7641d15b71...` | reference | 0.3 s | 0.99 M/s |
+| engine, sequential submit/cancel (run 1) | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.2 s | 1.40 M/s |
+| engine, sequential submit/cancel (run 2) | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.2 s | 1.60 M/s |
+| engine, mmap ring buffer + RingConsumer | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.1 s | 5.01 M/s |
+| engine, 4 threads on separate books #1 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.53 M/s |
+| engine, 4 threads on separate books #2 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.53 M/s |
+| engine, 4 threads on separate books #3 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.53 M/s |
+| engine, 4 threads on separate books #4 | 81,563 | `35599f72871a...` | `aa7641d15b71...` | yes | 0.8 s | 1.53 M/s |
 
 | Check | Result |
 |---|---|
@@ -157,14 +157,14 @@
 
 | Entry path | Fills | Fill fingerprint | Book fingerprint | Matches oracle | Time | Rate |
 |---|---:|---|---|---|---:|---:|
-| oracle (pure Python) | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | reference | 0.5 s | 0.81 M/s |
-| engine, sequential submit/cancel (run 1) | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 0.5 s | 0.87 M/s |
-| engine, sequential submit/cancel (run 2) | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 0.5 s | 0.84 M/s |
-| engine, mmap ring buffer + RingConsumer | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 0.2 s | 2.02 M/s |
-| engine, 4 threads on separate books #1 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.0 s | 0.81 M/s |
-| engine, 4 threads on separate books #2 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.0 s | 0.81 M/s |
-| engine, 4 threads on separate books #3 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.0 s | 0.81 M/s |
-| engine, 4 threads on separate books #4 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.0 s | 0.81 M/s |
+| oracle (pure Python) | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | reference | 0.5 s | 0.83 M/s |
+| engine, sequential submit/cancel (run 1) | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 0.6 s | 0.62 M/s |
+| engine, sequential submit/cancel (run 2) | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 0.7 s | 0.58 M/s |
+| engine, mmap ring buffer + RingConsumer | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 0.3 s | 1.41 M/s |
+| engine, 4 threads on separate books #1 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.5 s | 0.63 M/s |
+| engine, 4 threads on separate books #2 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.5 s | 0.63 M/s |
+| engine, 4 threads on separate books #3 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.5 s | 0.63 M/s |
+| engine, 4 threads on separate books #4 | 366,492 | `f617d3d54b38...` | `53cb27add5f5...` | yes | 2.5 s | 0.63 M/s |
 
 | Check | Result |
 |---|---|
@@ -194,14 +194,14 @@
 
 | Entry path | Fills | Fill fingerprint | Book fingerprint | Matches oracle | Time | Rate |
 |---|---:|---|---|---|---:|---:|
-| oracle (pure Python) | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | reference | 1.2 s | 0.26 M/s |
-| engine, sequential submit/cancel (run 1) | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 0.4 s | 0.77 M/s |
-| engine, sequential submit/cancel (run 2) | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 0.3 s | 0.87 M/s |
-| engine, mmap ring buffer + RingConsumer | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 0.3 s | 1.15 M/s |
-| engine, 4 threads on separate books #1 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.1 s | 0.58 M/s |
-| engine, 4 threads on separate books #2 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.1 s | 0.58 M/s |
-| engine, 4 threads on separate books #3 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.1 s | 0.58 M/s |
-| engine, 4 threads on separate books #4 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.1 s | 0.58 M/s |
+| oracle (pure Python) | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | reference | 1.3 s | 0.23 M/s |
+| engine, sequential submit/cancel (run 1) | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 0.5 s | 0.63 M/s |
+| engine, sequential submit/cancel (run 2) | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 0.4 s | 0.77 M/s |
+| engine, mmap ring buffer + RingConsumer | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 0.2 s | 1.38 M/s |
+| engine, 4 threads on separate books #1 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.2 s | 0.54 M/s |
+| engine, 4 threads on separate books #2 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.2 s | 0.54 M/s |
+| engine, 4 threads on separate books #3 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.2 s | 0.54 M/s |
+| engine, 4 threads on separate books #4 | 164,294 | `3e4bd63f62c1...` | `6357450ab2a9...` | yes | 2.2 s | 0.54 M/s |
 
 | Check | Result |
 |---|---|

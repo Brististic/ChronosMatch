@@ -40,3 +40,14 @@ python validation/run_match_validation.py --scale 0.1  # quick check
 Five stress scenarios are run through the engine on four entry paths (sequential, ring buffer, 4 threads, repeated)
 and compared, fill by fill and order by order, with an independent pure-Python reference engine.
 The command exits with status 0 only if every check passes.
+
+## Hot-path audit and the lean drain (Day 11)
+```
+python validation/check_python_api_free.py       # proves the matching hot path has no Python C-API calls
+```
+It translates the engine with Cython, checks every generated hot-path C function and every `with nogil:` block,
+reads the `cython -a` annotation scores, and writes `reports/python_api_audit.md`. The tests run it too.
+
+`RingConsumer.drain(book)` is the lean way to read the ring: it returns only the number of messages and adds the
+counters to `consumer.totals()`. `RingConsumer(..., track_latency=False)` also skips the latency clock read.
+A drain on an empty ring returns at once without taking the lock.

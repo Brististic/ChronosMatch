@@ -352,12 +352,22 @@ class TestLocking(RingTestCase):
 
     def test_times_out_when_a_live_process_holds_the_lock(self):
         consumer = RingConsumer(self.ring_path, self.lock_path, spin_timeout_sec=0.05)
+        self.ring.write_batch([pack(1, B, 50.0, 1)])             # a message is waiting, so the lock is needed
         self.lock.set_state(1, os.getppid() or os.getpid())      # held by a process that is alive
         started = time.perf_counter()
         with self.assertRaises(TimeoutError):
             consumer.drain_into(self.book)
         self.assertLess(time.perf_counter() - started, 2.0)
         self.assertEqual(self.lock.state()[0], 1)                # we did not steal a live lock
+        consumer.close()
+
+    def test_empty_ring_never_needs_the_lock(self):
+        consumer = RingConsumer(self.ring_path, self.lock_path, spin_timeout_sec=0.05)
+        self.lock.set_state(1, os.getppid() or os.getpid())      # lock held by a live process
+        r = consumer.drain_into(self.book)                       # nothing to read: returns at once, no time-out
+        self.assertEqual(r["messages"], 0)
+        self.assertEqual(consumer.drain(self.book), 0)
+        self.assertEqual(self.lock.state()[0], 1)                # and it did not touch the lock
         consumer.close()
 
     def test_stale_lock_of_a_dead_process_is_taken_over(self):
@@ -388,6 +398,135 @@ class ProcessHandle:
             self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+
+
+class TestLeanDrain(RingTestCase):
+    """Day 11: drain() is the lean path (returns only a count, keeps running totals)."""
+
+    def test_returns_the_message_count_and_matches_like_drain_into(self):
+        self.ring.write_batch([pack(1, S, 100.0, 50), pack(2, B, 101.0, 80), pack(3, B, 99.0, 5)])
+        self.assertEqual(self.consumer.drain(self.book), 3)
+        self.assertEqual(self.consumer.drain(self.book), 0)                     # nothing left
+        self.assertEqual(self.book.best_bid(), (101.0, 30))
+        self.assertEqual(self.consumer.pending(), 0)
+        self.assertTrue(self.book.check_integrity())
+
+    def test_running_totals(self):
+        self.ring.write_batch([pack(1, S, 100.0, 50), pack(2, B, 100.0, 20), pack(1, C, 0.0, 0), pack(77, C, 0.0, 0),
+                               pack(3, b"X", 1.0, 1)])
+        self.assertEqual(self.consumer.drain(self.book, 2), 2)
+        self.ring.write_batch([pack(4, B, 50.0, 5)])
+        self.assertEqual(self.consumer.drain(self.book), 4)
+        t = self.consumer.totals()
+        self.assertEqual((t["drains"], t["messages"]), (2, 6))
+        self.assertEqual((t["submitted"], t["cancels"], t["cancels_missed"], t["rejected"]), (3, 1, 1, 1))
+        self.assertEqual((t["fill_count"], t["filled_quantity"]), (1, 20))
+        self.assertEqual(self.consumer.consumed_total, 6)
+
+    def test_totals_equal_the_sum_of_drain_into_results(self):
+        rng = random.Random(5)
+        msgs = []
+        for oid in range(1, 3001):
+            msgs.append(pack(oid, rng.choice((B, S)), 100 + rng.randint(-6, 6) * 0.25, rng.randint(1, 60)))
+            if oid % 7 == 0:
+                msgs.append(pack(oid - 3, C, 0.0, 0))
+        lean, full = OrderBook(), OrderBook()
+        ring2_path, lock2_path = os.path.join(self.dir, "ring2.bin"), os.path.join(self.dir, "ring2.lock")
+        ring2 = RefRing(ring2_path, self.capacity, create=True)
+        RefLock(lock2_path, create=True).close()
+        full_consumer = RingConsumer(ring2_path, lock2_path)           # its own ring: two consumers must not share one
+        sums = {"messages": 0, "submitted": 0, "cancels": 0, "cancels_missed": 0, "rejected": 0,
+                "fill_count": 0, "filled_quantity": 0}
+        pos = 0
+        while pos < len(msgs):
+            chunk = msgs[pos:pos + 300]
+            pos += self.ring.write_batch(chunk)
+            ring2.write_batch(chunk)
+            r = full_consumer.drain_into(full)
+            for key in sums:
+                sums[key] += r[key]
+            self.consumer.drain(lean)
+        t = self.consumer.totals()
+        for key, value in sums.items():
+            self.assertEqual(t[key], value, key)
+        for side in (B, S):
+            self.assertEqual(lean.depth(side, 1000), full.depth(side, 1000))
+        full_consumer.close()
+        ring2.close()
+
+    def test_drain_into_does_not_change_the_running_totals(self):
+        self.ring.write_batch([pack(1, B, 50.0, 1)])
+        self.consumer.drain_into(self.book)
+        self.assertEqual(self.consumer.totals()["messages"], 0)
+
+    def test_fill_list_is_per_drain_even_though_the_buffer_is_reused(self):
+        self.ring.write_batch([pack(1, S, 100.0, 10), pack(2, B, 100.0, 10)])
+        first = self.consumer.drain_into(self.book, collect=True)
+        self.ring.write_batch([pack(3, S, 101.0, 5), pack(4, B, 101.0, 5)])
+        second = self.consumer.drain_into(self.book, collect=True)
+        self.assertEqual(first["fills"], [(2, 1, 100.0, 10)])
+        self.assertEqual(second["fills"], [(4, 3, 101.0, 5)])
+        self.ring.write_batch([pack(5, B, 10.0, 1)])
+        self.assertEqual(self.consumer.drain_into(self.book, collect=True)["fills"], [])
+
+    def test_an_empty_drain_does_not_repeat_the_previous_fills(self):
+        self.ring.write_batch([pack(1, S, 100.0, 10), pack(2, B, 100.0, 10)])
+        self.assertEqual(len(self.consumer.drain_into(self.book, collect=True)["fills"]), 1)
+        again = self.consumer.drain_into(self.book, collect=True)          # ring is empty now
+        self.assertEqual((again["messages"], again["fills"], again["fill_count"]), (0, [], 0))
+
+    def test_gil_is_released_in_the_lean_path_too(self):
+        self.ring.write_batch([pack(1, B, 50.0, 1)])
+        self.consumer.drain(self.book)
+        self.assertEqual(self.consumer.gil_held_in_last_drain, 0)
+
+    def test_latency_tracking_can_be_switched_off(self):
+        quiet = RingConsumer(self.ring_path, self.lock_path, track_latency=False)
+        self.ring.write_batch([pack(1, B, 50.0, 1, 1), pack(2, B, 50.0, 1, 1)])
+        r = quiet.drain_into(self.book)
+        self.assertEqual((r["messages"], r["latency_min_ns"], r["latency_max_ns"], r["latency_total_ns"]), (2, 0, 0, 0))
+        quiet.close()
+
+    def test_latency_totals_in_running_totals(self):
+        t0 = time.perf_counter_ns()
+        self.ring.write_batch([pack(i, B, 50.0, 1, t0) for i in range(1, 4)])
+        time.sleep(0.005)
+        self.consumer.drain(self.book)
+        t = self.consumer.totals()
+        self.assertGreaterEqual(t["latency_min_ns"], 4_000_000)
+        self.assertLessEqual(t["latency_min_ns"], t["latency_max_ns"])
+
+    def test_waits_for_a_busy_lock_and_then_succeeds(self):
+        self.ring.write_batch([pack(1, B, 50.0, 1)])
+        self.lock.set_state(1, os.getppid() or os.getpid())          # held by a live process
+        releaser = threading.Timer(0.05, self.lock.release)
+        releaser.start()
+        started = time.perf_counter()
+        self.assertEqual(self.consumer.drain(self.book), 1)           # slow path: waits, then takes the lock
+        releaser.join()
+        self.assertGreater(time.perf_counter() - started, 0.03)
+        self.assertEqual(self.lock.state(), (0, 0))
+
+    def test_lock_holder_pid_is_ours_while_we_hold_it(self):
+        # take the lock from a second thread's point of view during a long drain
+        self.ring.write_batch([pack(i, B, 50.0 + (i % 40) * 0.01, 1) for i in range(1, 1001)])
+        seen = []
+        stop = threading.Event()
+
+        def watch():
+            while not stop.is_set():
+                state = self.lock.state()
+                if state[0] == 1:
+                    seen.append(state[1])
+
+        t = threading.Thread(target=watch)
+        t.start()
+        for _ in range(50):
+            self.ring.write_batch([pack(100000 + _ * 10 + k, B, 40.0, 1) for k in range(10)])
+            self.consumer.drain(self.book)
+        stop.set()
+        t.join()
+        self.assertTrue(all(pid == os.getpid() for pid in seen))       # whenever it was locked, it was by us
 
 
 class TestConcurrentProducer(unittest.TestCase):
