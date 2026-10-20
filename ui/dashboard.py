@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque, namedtuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # Defaults. The launch flags below can override the first three at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
@@ -24,13 +24,21 @@ PAGE = 10              # lines moved by PgUp / PgDn
 
 # Binary layout of one matched fill coming from the engine.
 # PLACEHOLDER: confirm the real layout with the IPC/engine members.
-FILL_STRUCT = struct.Struct("<QBIdQ")  # order_id, side, qty, price, ts_ns
-Fill = namedtuple("Fill", "order_id side qty price ts_ns")
+#   ts_ns      wall-clock time of the trade (for display)
+#   ingress_ns time.perf_counter_ns() stamped when the order entered the system
+FILL_STRUCT = struct.Struct("<QBIdQQ")
+RawFill = namedtuple("RawFill", "order_id side qty price ts_ns ingress_ns")
+# egress_ns is stamped by the UI reader when it decodes the fill.
+# latency_ns = egress_ns - ingress_ns (None if the clocks disagree).
+Fill = namedtuple(
+    "Fill", "order_id side qty price ts_ns ingress_ns egress_ns latency_ns"
+)
 SIDE_BUY, SIDE_SELL = 0, 1
 
 LatencyStats = namedtuple("LatencyStats", "last avg min max")
 Snapshot = namedtuple(
-    "Snapshot", "book rate peak total fills fill_total latency polls"
+    "Snapshot",
+    "book rate peak total fills fill_total latency polls clock_errors",
 )
 
 
@@ -184,7 +192,8 @@ class MockEngineStream:
     """Stands in for the engine output until the real one exists.
 
     Replace this class with the real stream. It only needs:
-      - read() -> (orders_processed: int, fill_bytes: bytes, latency_us: float)
+      - read() -> (orders_processed: int, fill_bytes: bytes)
+        where every fill carries the ingress perf_counter_ns() stamp
       - book   -> object with .bids and .asks (lists of (price, qty))
     """
 
@@ -206,14 +215,20 @@ class MockEngineStream:
             side = random.choice((SIDE_BUY, SIDE_SELL))
             price = self.book.bids[0][0] if side == SIDE_SELL else self.book.asks[0][0]
             qty = random.randint(10, 500)
-            raw = FILL_STRUCT.pack(self.next_id, side, qty, price, time.time_ns())
+
+            # Mock engine: pretend the order entered ~25 us ago (with the
+            # odd spike) by backdating its ingress timestamp.
+            latency_us = max(1.0, random.gauss(25, 4))
+            if random.random() < 0.05:
+                latency_us *= 3
+            ingress_ns = time.perf_counter_ns() - int(latency_us * 1000)
+
+            raw = FILL_STRUCT.pack(
+                self.next_id, side, qty, price, time.time_ns(), ingress_ns
+            )
             self.next_id += 1
 
-        # mock engine latency: around 25 us with occasional spikes
-        latency_us = max(1.0, random.gauss(25, 4))
-        if random.random() < 0.01:
-            latency_us *= 3
-        return n_orders, raw, latency_us
+        return n_orders, raw
 
 
 def make_stream(args):
@@ -224,13 +239,14 @@ def make_stream(args):
 
 
 class EngineReader:
-    """Reads the engine stream, decodes fills and keeps them in buffers."""
+    """Reads the engine stream, decodes fills and stamps their egress time."""
 
     def __init__(self, stream):
         self.stream = stream
         self.fills = deque(maxlen=FILL_BUFFER)
-        self.latencies = deque(maxlen=LATENCY_BUFFER)
+        self.latencies = deque(maxlen=LATENCY_BUFFER)  # nanoseconds
         self.fill_total = 0
+        self.clock_errors = 0
 
     @property
     def book(self):
@@ -238,11 +254,22 @@ class EngineReader:
 
     def poll(self):
         """Pull new data. Returns how many orders the engine processed."""
-        n_orders, raw, latency_us = self.stream.read()
-        self.latencies.append(latency_us)
+        n_orders, raw = self.stream.read()
         size = FILL_STRUCT.size
         for off in range(0, len(raw) - size + 1, size):
-            self.fills.append(Fill(*FILL_STRUCT.unpack_from(raw, off)))
+            egress_ns = time.perf_counter_ns()  # egress timestamp
+            rf = RawFill(*FILL_STRUCT.unpack_from(raw, off))
+
+            latency_ns = egress_ns - rf.ingress_ns
+            if latency_ns < 0:
+                # egress before ingress means the clocks disagree: don't
+                # let one bad sample pollute the statistics
+                self.clock_errors += 1
+                latency_ns = None
+            else:
+                self.latencies.append(latency_ns)
+
+            self.fills.append(Fill(*rf, egress_ns, latency_ns))
             self.fill_total += 1
         return n_orders
 
@@ -274,11 +301,12 @@ class ThroughputMeter:
         return (c1 - c0) / dt if dt > 0 else 0.0
 
 
-def latency_stats(samples):
-    if not samples:
+def latency_stats(samples_ns):
+    """Latency samples in nanoseconds -> LatencyStats in microseconds."""
+    if not samples_ns:
         return None
-    return LatencyStats(samples[-1], sum(samples) / len(samples),
-                        min(samples), max(samples))
+    us = [s / 1000 for s in samples_ns]
+    return LatencyStats(us[-1], sum(us) / len(us), min(us), max(us))
 
 
 class EngineWorker(threading.Thread):
@@ -320,6 +348,7 @@ class EngineWorker(threading.Thread):
                 fill_total=r.fill_total,
                 latency=latency_stats(list(r.latencies)),
                 polls=self.polls,
+                clock_errors=r.clock_errors,
             )
 
     def stop(self):
@@ -446,7 +475,7 @@ def draw_metrics(win, snap):
     put(win, 6, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]")
     put(win, 7, 2, f"target {TARGET_OPS:,}/s")
 
-    # latency in microseconds
+    # latency = egress_ns - ingress_ns, shown in microseconds
     put(win, 9, 2, "Latency (us)", curses.A_BOLD)
     lat = snap.latency
     if lat is None:
@@ -454,6 +483,8 @@ def draw_metrics(win, snap):
     else:
         put(win, 10, 2, f"{'last':<5}{lat.last:>8.1f}{'avg':>6}{lat.avg:>8.1f}")
         put(win, 11, 2, f"{'min':<5}{lat.min:>8.1f}{'max':>6}{lat.max:>8.1f}")
+    if snap.clock_errors:
+        put(win, 12, 2, f"bad timestamps: {snap.clock_errors}", curses.A_REVERSE)
 
     win.noutrefresh()
 
@@ -463,6 +494,13 @@ def fmt_time(ts_ns):
     secs = ts_ns // 1_000_000_000
     ms = (ts_ns // 1_000_000) % 1000
     return time.strftime("%H:%M:%S", time.localtime(secs)) + f".{ms:03d}"
+
+
+def fmt_latency(latency_ns):
+    """Nanoseconds -> microseconds text, 'n/a' if the sample was invalid."""
+    if latency_ns is None:
+        return "n/a"
+    return f"{latency_ns / 1000:.1f}"
 
 
 def draw_log(win, snap, view):
@@ -483,7 +521,8 @@ def draw_log(win, snap, view):
         status = f"PAUSED  +{view.offset} newer  (f: resume)"
         status_attr = curses.A_REVERSE
     put(win, 1, 2, f"{status}   fills: {snap.fill_total:,}", status_attr)
-    put(win, 2, 2, f"{'TIME':<13}{'ORDER':<11}{'SIDE':<6}{'QTY':>6}   {'PRICE':>9}",
+    put(win, 2, 2,
+        f"{'TIME':<13}{'ORDER':<11}{'SIDE':<6}{'QTY':>6}   {'PRICE':>9} {'LAT(us)':>9}",
         curses.A_BOLD)
 
     end = total - view.offset
@@ -492,7 +531,7 @@ def draw_log(win, snap, view):
     for i, f in enumerate(visible):
         side = "BUY" if f.side == SIDE_BUY else "SELL"
         line = (f"{fmt_time(f.ts_ns):<13}#{f.order_id:<10}{side:<6}"
-                f"{f.qty:>6} @ {f.price:>9.2f}")
+                f"{f.qty:>6} @ {f.price:>9.2f} {fmt_latency(f.latency_ns):>9}")
         newest = view.follow and i == len(visible) - 1
         put(win, 3 + i, 2, line, curses.A_BOLD if newest else 0)
 
@@ -609,7 +648,15 @@ if __name__ == "__main__":
     if error:
         raise error
     if last:
+        res_ns = time.get_clock_info("perf_counter").resolution * 1e9
         print(
             f"Session ended: {last.total:,} orders processed, "
             f"peak {last.peak:,.0f} orders/sec, {last.fill_total:,} fills"
         )
+        if last.latency:
+            print(
+                f"Latency (us): avg {last.latency.avg:.1f}, "
+                f"min {last.latency.min:.1f}, max {last.latency.max:.1f}  "
+                f"| clock resolution {res_ns:.0f} ns, "
+                f"bad timestamps {last.clock_errors}"
+            )
