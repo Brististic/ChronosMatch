@@ -10,6 +10,8 @@ Day 3: price-time priority queue per price level (see price_level.pxd) and
 Day 4: limit order book with insert and cancel (see order_book.pxd) and the
        OrderBook wrapper used to test it from Python.
 Day 5: matching of crossing limit orders (see matching.pxd): OrderBook.submit().
+Day 12: order nodes and price levels come from pre-allocated memory pools (pool.pxd) instead of
+        malloc/free; OrderBook(order_capacity=..., level_capacity=..., grow=...) sizes them.
 Day 9: RingConsumer reads orders straight out of the memory-mapped ring buffer (Member 1's
        layout) into the matching loop - no Python bytes objects, no per-order Python call.
 Day 8: price levels are found through a contiguous table indexed by integer price ticks
@@ -25,7 +27,7 @@ import sys
 import time
 from libc.stdint cimport int64_t, uint8_t, uint32_t, uint64_t
 from libc.string cimport memcpy, memset
-from libc.stdlib cimport malloc, free
+from libc.stdlib cimport malloc, free, qsort
 from cpython.buffer cimport PyObject_GetBuffer, PyBuffer_Release, PyBUF_WRITABLE
 
 from chronos_engine.order_types cimport (
@@ -36,16 +38,34 @@ from chronos_engine.price_level cimport (
     PriceLevel, level_init, level_is_empty, level_peek_front, level_push_back,
     level_remove, level_pop_front, price_better,
 )
+from chronos_engine.pool cimport Pool
 from chronos_engine.order_book cimport (
     Book, BookSide, BOOK_OK, BOOK_ERR_DUPLICATE, BOOK_ERR_INVALID,
-    BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND, BOOK_ERR_RANGE,
+    BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND, BOOK_ERR_RANGE, BOOK_ERR_FULL,
     book_init, book_destroy, book_insert, book_cancel, book_check,
     side_best, side_next, side_find_tick, price_to_tick, idmap_find, IdEntry,
 )
 from chronos_engine.matching cimport (
     Fill, FillBuffer, SubmitSummary, fillbuf_init, fillbuf_free, fillbuf_clear,
-    book_submit, book_submit_ex,
+    book_submit, book_submit_ex, fillbuf_prealloc,
 )
+
+cdef extern from *:
+    """
+    #include <chrono>
+    static inline unsigned long long cm_now_ns() {
+        return (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    """
+    unsigned long long cm_now_ns() noexcept nogil
+
+
+cdef int _cmp_u64(const void* a, const void* b) noexcept nogil:
+    cdef unsigned long long x = (<const unsigned long long*> a)[0]
+    cdef unsigned long long y = (<const unsigned long long*> b)[0]
+    return -1 if x < y else (1 if x > y else 0)
+
 
 cdef extern from "<mutex>" namespace "std" nogil:
     cdef cppclass mutex:
@@ -371,12 +391,17 @@ cdef class OrderBook:
     cdef mutex _lock
     cdef int _gil_probe          # PyGILState_Check() seen inside the last nogil match (-1 = none yet)
 
-    def __cinit__(self, long long price_scale=100):
+    def __cinit__(self, long long price_scale=100, unsigned long long order_capacity=1024,
+                  unsigned long long level_capacity=128, bint grow=True):
         if price_scale < 1 or price_scale > 1000000:
             raise ValueError("price_scale must be between 1 and 1,000,000 (ticks per 1.00)")
+        if order_capacity < 1 or order_capacity > 200000000:
+            raise ValueError("order_capacity must be between 1 and 200,000,000")
+        if level_capacity < 1 or level_capacity > 50000000:
+            raise ValueError("level_capacity must be between 1 and 50,000,000")
         self._gil_probe = -1
-        if book_init(&self._book, price_scale) != BOOK_OK:
-            raise MemoryError()
+        if book_init(&self._book, price_scale, <uint32_t> order_capacity, <uint32_t> level_capacity, grow) != BOOK_OK:
+            raise MemoryError("could not reserve the order and price-level pools")
 
     def __dealloc__(self):
         book_destroy(&self._book)
@@ -396,6 +421,29 @@ cdef class OrderBook:
     @property
     def tick_size(self):
         return 1.0 / self._book.price_scale
+
+    def pool_stats(self):
+        """
+        State of the two memory pools:
+          {"orders": {...}, "levels": {...}, "grow": bool} where each pool reports
+          capacity (elements reserved), in_use, peak (highest in_use so far), slabs (blocks obtained
+          from the system) and system_allocations (malloc/realloc calls the pool has made in total).
+        Once the pools are big enough, system_allocations stops changing: that is the proof that
+        insert, cancel and matching no longer call the system allocator.
+        """
+        self._acquire()
+        try:
+            return {"orders": {"capacity": self._book.nodes.capacity, "in_use": self._book.nodes.in_use,
+                               "peak": self._book.nodes.peak, "slabs": self._book.nodes.slab_count,
+                               "system_allocations": self._book.nodes.system_allocs,
+                               "element_bytes": self._book.nodes.elem_size},
+                    "levels": {"capacity": self._book.levels.capacity, "in_use": self._book.levels.in_use,
+                               "peak": self._book.levels.peak, "slabs": self._book.levels.slab_count,
+                               "system_allocations": self._book.levels.system_allocs,
+                               "element_bytes": self._book.levels.elem_size},
+                    "grow": bool(self._book.nodes.grow)}
+        finally:
+            self._release()
 
     @property
     def gil_held_in_last_match(self):
@@ -426,6 +474,8 @@ cdef class OrderBook:
             raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, price > 0 and a whole number of ticks)")
         if rc == BOOK_ERR_RANGE:
             raise ValueError("price is too far from the other prices on this side of the book")
+        if rc == BOOK_ERR_FULL:
+            raise MemoryError("the order or price-level pool is full (grow=False)")
         raise MemoryError()
 
     def insert(self, unsigned long long order_id, bytes side, double price,
@@ -468,6 +518,8 @@ cdef class OrderBook:
             raise ValueError("invalid order (side must be b'B'/b'S', quantity > 0, price > 0 and a whole number of ticks)")
         if rc == BOOK_ERR_RANGE:
             raise ValueError("price is too far from the other prices on this side of the book")
+        if rc == BOOK_ERR_FULL:
+            raise MemoryError("the order or price-level pool is full (grow=False)")
         raise MemoryError()
 
     def submit(self, unsigned long long order_id, bytes side, double price,
@@ -755,7 +807,7 @@ def bench_insert_cancel(int n=100000, int levels=200):
     cdef int i
     cdef uint64_t seed = 88172645463325252ULL
     cdef int rc = 0
-    if book_init(&b, 100) != BOOK_OK:
+    if book_init(&b, 100, <uint32_t> (n if n > 1024 else 1024), <uint32_t> (2 * levels + 16), True) != BOOK_OK:
         raise MemoryError()
     t0 = time.perf_counter_ns()
     with nogil:
@@ -794,7 +846,7 @@ def bench_match(int n=100000):
     cdef Order o
     cdef int i
     cdef int rc = 0
-    if book_init(&b, 100) != BOOK_OK:
+    if book_init(&b, 100, <uint32_t> (n + 1024), 256, True) != BOOK_OK:
         raise MemoryError()
     fillbuf_init(&fills)
     o.timestamp_ns = 0
@@ -994,6 +1046,8 @@ cdef class RingConsumer:
             self._lockp = <unsigned char*> self._lock_buf.buf
         self._staging = <unsigned char*> malloc(<size_t> max_batch * sizeof(WireOrder))
         if self._staging == NULL:
+            raise MemoryError()
+        if fillbuf_prealloc(&self._fills, max_batch) != BOOK_OK:        # no realloc during ordinary batches
             raise MemoryError()
 
     def __dealloc__(self):
@@ -1279,3 +1333,62 @@ def gil_check_demo():
     with nogil:
         inside = PyGILState_Check()
     return (outside, inside)
+
+
+def bench_latency(int n=200000, int levels=200):
+    """
+    Time EVERY insert and EVERY cancel separately inside nogil C code and report the distribution in
+    nanoseconds: {"insert": {...}, "cancel": {...}} with p50, p90, p99, p99_9 and max.
+    The tail (p99.9 and max) is what a memory pool improves: malloc is fast on average but sometimes slow.
+    Each timing includes about 25-50 ns of clock-reading overhead (the same for every build).
+    """
+    cdef Book b
+    cdef Order o
+    cdef int i
+    cdef int rc = 0
+    cdef uint64_t seed = 88172645463325252ULL
+    cdef unsigned long long t0
+    cdef unsigned long long* ins = <unsigned long long*> malloc(<size_t> n * sizeof(unsigned long long))
+    cdef unsigned long long* can = <unsigned long long*> malloc(<size_t> n * sizeof(unsigned long long))
+    if ins == NULL or can == NULL:
+        free(ins)
+        free(can)
+        raise MemoryError()
+    if book_init(&b, 100, <uint32_t> (n if n > 1024 else 1024), <uint32_t> (2 * levels + 16), True) != BOOK_OK:
+        free(ins)
+        free(can)
+        raise MemoryError()
+    with nogil:
+        for i in range(n):
+            seed ^= seed << 13
+            seed ^= seed >> 7
+            seed ^= seed << 17
+            o.order_id = i + 1
+            o.timestamp_ns = i
+            o.quantity = 100
+            if i & 1:
+                o.side = SIDE_BUY
+                o.price = 50000.0 - (seed % levels) * 0.01
+            else:
+                o.side = SIDE_SELL
+                o.price = 50001.0 + (seed % levels) * 0.01
+            t0 = cm_now_ns()
+            rc |= book_insert(&b, &o)
+            ins[i] = cm_now_ns() - t0
+        for i in range(n):
+            t0 = cm_now_ns()
+            rc |= book_cancel(&b, i + 1)
+            can[i] = cm_now_ns() - t0
+        qsort(ins, n, sizeof(unsigned long long), _cmp_u64)
+        qsort(can, n, sizeof(unsigned long long), _cmp_u64)
+    book_destroy(&b)
+    result = {}
+    for name, arr in (("insert", 0), ("cancel", 1)):
+        a = ins if arr == 0 else can
+        result[name] = {"p50": a[n // 2], "p90": a[n * 9 // 10], "p99": a[n * 99 // 100],
+                        "p99_9": a[n * 999 // 1000], "max": a[n - 1]}
+    free(ins)
+    free(can)
+    if rc != 0:
+        raise RuntimeError("benchmark operation failed")
+    return result

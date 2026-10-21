@@ -74,6 +74,16 @@ cdef inline void fillbuf_clear(FillBuffer* f) noexcept nogil:
     f.count = 0
 
 
+cdef inline int fillbuf_prealloc(FillBuffer* f, uint32_t n) noexcept nogil:
+    # Allocate room for n fills up front so that ordinary batches never reallocate (Day 12).
+    cdef Fill* grown = <Fill*> realloc(f.items, n * sizeof(Fill))
+    if grown == NULL:
+        return BOOK_ERR_NOMEM
+    f.items = grown
+    f.capacity = n
+    return BOOK_OK
+
+
 cdef inline Fill* fillbuf_reserve(FillBuffer* f) noexcept nogil:
     # Returns a pointer to a fresh slot at the end, or NULL when out of memory.
     cdef uint32_t new_capacity

@@ -4,6 +4,7 @@ from ._matching import (
     OrderBook,
     RingConsumer,
     bench_insert_cancel,
+    bench_latency,
     bench_match,
     build_info,
     cpp_standard,
@@ -20,6 +21,7 @@ __all__ = [
     "OrderBook",
     "RingConsumer",
     "bench_insert_cancel",
+    "bench_latency",
     "bench_match",
     "build_info",
     "cpp_standard",
@@ -30,4 +32,4 @@ __all__ = [
     "selftest_linked_nodes",
     "selftest_nogil",
 ]
-__version__ = "0.10.0"
+__version__ = "0.12.0"

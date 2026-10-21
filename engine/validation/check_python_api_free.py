@@ -39,7 +39,7 @@ API = re.compile(r"\b(Py[A-Z_]\w*|_Py\w+|__Pyx_\w+|__pyx_(?:m|d|b|n_s_\w+|kp_\w+
 # ... except the bookkeeping Cython itself emits around `with nogil:` and the one documented probe.
 ALLOWED_IN_NOGIL = {"PyThreadState", "__Pyx_FastGIL_Remember", "__Pyx_FastGIL_Forget", "PyEval_SaveThread",
                     "PyEval_RestoreThread", "PyGILState_Check"}
-PURE_C_MODULES = {"order_types", "price_level", "order_book", "matching"}      # the .pxd helper modules
+PURE_C_MODULES = {"order_types", "price_level", "order_book", "matching", "pool"}      # the .pxd helper modules
 COMMENT = re.compile(r"/\*.*?\*/", re.S)
 # Per-call cost of the Day 9 ring reader, measured before the Day 11 change (author's sandbox, median of 5 rounds).
 DAY9_BASELINE_NS = {"drain_into() - returns a dict": 1250, "drain_into() on an EMPTY ring": 1020}
@@ -287,8 +287,8 @@ def build_report(audit, engine_version):
     w("")
     w("## How the audit works")
     w("")
-    w("1. `_matching.pyx` and the four `.pxd` helper files are translated to C++ by Cython with annotation enabled.")
-    w("2. Every C function generated from the helpers (the order book, price-level queues, id table, matcher, and the ring-copy routine) is "
+    w("1. `_matching.pyx` and the five `.pxd` helper files are translated to C++ by Cython with annotation enabled.")
+    w("2. Every C function generated from the helpers (the order book, price-level queues, id table, matcher, memory pool, and the ring-copy routine) is "
       "searched for Python runtime calls: any `Py...`, `__Pyx_...` or Python global name counts as a violation.")
     w("3. Every `with nogil:` block in the Python-facing methods is searched the same way, allowing only Cython's own GIL bookkeeping and the probe.")
     w("4. The annotation scores are read back: a score above 0 inside a nogil block means Cython had to talk to Python on that line.")

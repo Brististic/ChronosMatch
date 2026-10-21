@@ -51,3 +51,16 @@ reads the `cython -a` annotation scores, and writes `reports/python_api_audit.md
 `RingConsumer.drain(book)` is the lean way to read the ring: it returns only the number of messages and adds the
 counters to `consumer.totals()`. `RingConsumer(..., track_latency=False)` also skips the latency clock read.
 A drain on an empty ring returns at once without taking the lock.
+
+## Memory pools (Day 12)
+Order nodes and price levels come from pre-allocated pools, not from malloc/free:
+```python
+book = OrderBook(order_capacity=1_000_000, level_capacity=10_000)   # reserve room for the expected peak
+book.pool_stats()      # capacity, in_use, peak, slabs, system_allocations for both pools
+```
+- While the book stays inside the reserved size, insert, cancel and matching make no system allocator call
+  (`system_allocations` stops changing). The id table is sized for the same number of orders and made resident at creation.
+- Defaults are 1,024 orders and 128 levels; a pool that runs out adds a slab (a rare, one-off cost).
+  `grow=False` makes the pools strictly fixed: new orders then raise `MemoryError` (counted as rejected on the ring path).
+- `CHRONOS_DEBUG=1 python setup.py build_ext --inplace` builds a debug version that fills freed pool elements with 0xDD.
+- `bench_latency()` reports the per-operation latency distribution (p50 / p99 / p99.9 / max).

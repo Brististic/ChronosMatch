@@ -68,7 +68,8 @@ class TestHotPathIsFreeOfPythonApi(unittest.TestCase):
     def test_audit_actually_looked_at_the_engine(self):
         names = {short for _, short, _, _ in self.audit.functions}
         for must in ("book_submit_ex", "book_insert", "book_cancel", "idmap_find", "side_find_tick",
-                     "level_push_back", "_ring_take", "price_to_tick", "node_alloc"):
+                     "level_push_back", "_ring_take", "price_to_tick", "node_alloc",
+                     "pool_alloc", "pool_free", "pool_add_slab"):
             self.assertIn(must, names)
         self.assertGreaterEqual(len(self.audit.functions), 25)
         owners = " ".join(b[0] for b in self.audit.blocks)

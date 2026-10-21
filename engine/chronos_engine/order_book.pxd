@@ -18,16 +18,24 @@ Layout
   * cancel = hash lookup gives node AND level directly, then an O(1) unlink.
              A level is freed only when it becomes empty.
 
+Day 12: orders (OrderNode) and price levels (PriceLevel) come from pre-allocated memory POOLS, not from
+malloc/free. Insert and cancel then never call the system allocator once the pools are big enough
+(OrderBook(order_capacity=..., level_capacity=...)); a pool that runs out adds a slab (grow=True) or reports
+BOOK_ERR_FULL (grow=False).
+
 Day 4 only RESTS orders (no matching yet): a crossed book is possible until the
 matching routine arrives. Everything is plain C (noexcept nogil), no Python objects.
 """
 from libc.stdint cimport int64_t, uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport malloc, calloc, realloc, free
-from libc.string cimport memmove
+from libc.string cimport memmove, memset
 from libc.math cimport llround, fabs
 
 from chronos_engine.order_types cimport (
-    Order, OrderNode, SIDE_BUY, SIDE_SELL, node_alloc, node_free, side_is_valid,
+    Order, OrderNode, SIDE_BUY, SIDE_SELL, side_is_valid,
+)
+from chronos_engine.pool cimport (
+    Pool, pool_init, pool_alloc, pool_free, pool_destroy, pool_check,
 )
 from chronos_engine.price_level cimport (
     PriceLevel, level_init, level_is_empty, level_push_back, level_remove,
@@ -42,6 +50,7 @@ cdef enum BookStatus:
     BOOK_ERR_NOMEM = 3
     BOOK_ERR_NOT_FOUND = 4
     BOOK_ERR_RANGE = 5          # price too far from the prices already on this side (Day 8)
+    BOOK_ERR_FULL = 6           # a fixed-size pool (grow=False) has no free element left (Day 12)
 
 
 # ------------------------------------------------------------------ IdMap ----
@@ -77,12 +86,16 @@ cdef inline uint64_t idmap_hash(uint64_t key) noexcept nogil:
 
 
 cdef inline int idmap_init(IdMap* m, uint64_t capacity) noexcept nogil:
-    m.slots = <IdEntry*> calloc(capacity, sizeof(IdEntry))
+    # malloc + memset, not calloc: calloc hands out pages the operating system has not really provided yet,
+    # and the first write to each page (a "page fault") would then happen in the middle of trading.
+    # Writing the zeros here makes the table resident NOW, when the book is created (Day 12).
+    m.slots = <IdEntry*> malloc(<size_t> capacity * sizeof(IdEntry))
     m.used = 0
     m.tombstones = 0
     if m.slots == NULL:
         m.capacity = 0
         return BOOK_ERR_NOMEM
+    memset(m.slots, 0, <size_t> capacity * sizeof(IdEntry))
     m.capacity = capacity
     return BOOK_OK
 
@@ -111,11 +124,12 @@ cdef inline IdEntry* idmap_find(IdMap* m, uint64_t key) noexcept nogil:
 cdef inline int idmap_rehash(IdMap* m, uint64_t new_capacity) noexcept nogil:
     cdef IdEntry* old = m.slots
     cdef uint64_t old_capacity = m.capacity
-    cdef IdEntry* fresh = <IdEntry*> calloc(new_capacity, sizeof(IdEntry))
+    cdef IdEntry* fresh = <IdEntry*> malloc(<size_t> new_capacity * sizeof(IdEntry))
     cdef uint64_t mask = new_capacity - 1
     cdef uint64_t i, j
     if fresh == NULL:
         return BOOK_ERR_NOMEM
+    memset(fresh, 0, <size_t> new_capacity * sizeof(IdEntry))     # resident now, not at the first write
     for i in range(old_capacity):
         if old[i].state == SLOT_USED:
             j = idmap_hash(old[i].key) & mask
@@ -189,6 +203,7 @@ cdef struct BookSide:
     uint32_t level_count        # how many entries are non-NULL
     int64_t best_tick           # tick of the best level (valid when level_count > 0)
     uint8_t side                # SIDE_BUY or SIDE_SELL
+    Pool* levels_pool           # where this side's PriceLevels come from (the book's level pool)
 
 
 cdef struct Book:
@@ -197,6 +212,8 @@ cdef struct Book:
     IdMap ids
     uint64_t next_trade_id      # id given to the next executed trade (starts at 1)
     int64_t price_scale         # ticks per 1.00 of price (100 -> tick = 0.01)
+    Pool nodes                  # pool of OrderNode (Day 12)
+    Pool levels                 # pool of PriceLevel (Day 12)
 
 
 cdef inline bint price_to_tick(const Book* b, double price, int64_t* tick) noexcept nogil:
@@ -233,6 +250,7 @@ cdef inline void side_init(BookSide* s, uint8_t side) noexcept nogil:
     s.level_count = 0
     s.best_tick = 0
     s.side = side
+    s.levels_pool = NULL
 
 
 cdef inline PriceLevel* side_find_tick(const BookSide* s, int64_t tick) noexcept nogil:
@@ -282,7 +300,7 @@ cdef inline int side_ensure(BookSide* s, int64_t tick) noexcept nogil:
 
 cdef inline PriceLevel* side_create_level(BookSide* s, int64_t tick, int64_t scale) noexcept nogil:
     # Caller has called side_ensure(tick) and found no level there.
-    cdef PriceLevel* lvl = <PriceLevel*> malloc(sizeof(PriceLevel))
+    cdef PriceLevel* lvl = <PriceLevel*> pool_alloc(s.levels_pool)
     if lvl == NULL:
         return NULL
     level_init(lvl, <double> tick / <double> scale, tick)   # exact integer / exact integer
@@ -327,21 +345,11 @@ cdef inline void side_remove_level(BookSide* s, PriceLevel* lvl) noexcept nogil:
     if s.level_count > 0 and lvl.tick == s.best_tick:
         nxt = side_next(s, lvl)                         # best level emptied: find the new best
         s.best_tick = nxt.tick
-    free(lvl)
+    pool_free(s.levels_pool, lvl)
 
 
 cdef inline void side_destroy(BookSide* s) noexcept nogil:
-    cdef int64_t i
-    cdef OrderNode* node
-    cdef OrderNode* nxt
-    for i in range(s.size):
-        if s.table[i] != NULL:
-            node = s.table[i].head
-            while node != NULL:
-                nxt = node.next
-                node_free(node)
-                node = nxt
-            free(s.table[i])
+    # The nodes and levels live in the book's pools, which are released as a whole by book_destroy.
     free(s.table)
     s.table = NULL
     s.size = 0
@@ -349,18 +357,37 @@ cdef inline void side_destroy(BookSide* s) noexcept nogil:
 
 
 # ------------------------------------------------------------------- Book ----
-cdef inline int book_init(Book* b, int64_t price_scale) noexcept nogil:
+cdef inline int book_init(Book* b, int64_t price_scale, uint32_t order_capacity,
+                          uint32_t level_capacity, bint grow) noexcept nogil:
+    # Reserves room for `order_capacity` orders and `level_capacity` price levels (both sides together)
+    # and sizes the id table so that many orders fit without a rehash.
+    cdef uint64_t idcap = 1024
     side_init(&b.bids, SIDE_BUY)
     side_init(&b.asks, SIDE_SELL)
     b.next_trade_id = 1
     b.price_scale = price_scale
-    return idmap_init(&b.ids, 1024)
+    if pool_init(&b.nodes, sizeof(OrderNode), order_capacity, 1024, grow) != 0:
+        return BOOK_ERR_NOMEM
+    if pool_init(&b.levels, sizeof(PriceLevel), level_capacity, 64, grow) != 0:
+        pool_destroy(&b.nodes)
+        return BOOK_ERR_NOMEM
+    b.bids.levels_pool = &b.levels
+    b.asks.levels_pool = &b.levels
+    while idcap < 2 * <uint64_t> order_capacity:
+        idcap <<= 1
+    if idmap_init(&b.ids, idcap) != BOOK_OK:
+        pool_destroy(&b.nodes)
+        pool_destroy(&b.levels)
+        return BOOK_ERR_NOMEM
+    return BOOK_OK
 
 
 cdef inline void book_destroy(Book* b) noexcept nogil:
     side_destroy(&b.bids)
     side_destroy(&b.asks)
     idmap_free(&b.ids)
+    pool_destroy(&b.nodes)
+    pool_destroy(&b.levels)
 
 
 cdef inline bint order_is_valid(const Order* order) noexcept nogil:
@@ -386,15 +413,15 @@ cdef inline int book_insert(Book* b, const Order* order) noexcept nogil:
     rc = side_ensure(s, tick)
     if rc != BOOK_OK:
         return rc
-    node = node_alloc()
+    node = <OrderNode*> pool_alloc(&b.nodes)
     if node == NULL:
-        return BOOK_ERR_NOMEM
+        return BOOK_ERR_NOMEM if b.nodes.grow else BOOK_ERR_FULL
     lvl = side_find_tick(s, tick)
     if lvl == NULL:
         lvl = side_create_level(s, tick, b.price_scale)
         if lvl == NULL:
-            node_free(node)
-            return BOOK_ERR_NOMEM
+            pool_free(&b.nodes, node)
+            return BOOK_ERR_NOMEM if b.levels.grow else BOOK_ERR_FULL
         created = True
     node.order = order[0]
     node.order.price = lvl.price                      # snap to the exact tick price
@@ -404,7 +431,7 @@ cdef inline int book_insert(Book* b, const Order* order) noexcept nogil:
         level_remove(lvl, node)
         if created:
             side_remove_level(s, lvl)
-        node_free(node)
+        pool_free(&b.nodes, node)
         return rc
     return BOOK_OK
 
@@ -424,7 +451,7 @@ cdef inline int book_cancel(Book* b, uint64_t order_id) noexcept nogil:
     level_remove(lvl, node)
     if level_is_empty(lvl):
         side_remove_level(s, lvl)                     # no empty levels on the book
-    node_free(node)
+    pool_free(&b.nodes, node)
     return BOOK_OK
 
 
@@ -495,4 +522,11 @@ cdef inline bint book_check(Book* b) noexcept nogil:
         return False
     if not side_check(&b.asks, &b.ids, &total, b.price_scale):
         return False
-    return total == b.ids.used
+    if total != b.ids.used:
+        return False
+    # the pools must agree with the book: one node per resting order, one level per price level
+    if b.nodes.in_use != b.ids.used or not pool_check(&b.nodes):
+        return False
+    if b.levels.in_use != <uint64_t> b.bids.level_count + b.asks.level_count or not pool_check(&b.levels):
+        return False
+    return True
