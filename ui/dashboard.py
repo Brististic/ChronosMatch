@@ -6,21 +6,25 @@ import threading
 import time
 from collections import deque, namedtuple
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
-# Defaults. The launch flags below can override the first three at startup.
+# Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
 LEVELS = 5             # price levels shown per side
 TARGET_OPS = 100_000   # target throughput from the project plan
+LATENCY_BUFFER = 5000  # rolling window: how many latency samples are kept
 
 WORKER_SLEEP = 0.001   # engine consumer loop pause
 TICK = 0.01            # price step between levels
 MAX_QTY = 2000
 FILL_BUFFER = 500      # how many recent fills the UI keeps
-LATENCY_BUFFER = 5000  # how many latency samples are kept
 
-MIN_H, MIN_W = 26, 70  # smallest terminal the layout fits in
+MIN_H, MIN_W = 28, 70  # smallest terminal the layout fits in
 PAGE = 10              # lines moved by PgUp / PgDn
+
+# Percentiles shown in the Metrics panel, in permille (per 1000) so the
+# maths stays in whole numbers: 999 = 99.9th percentile.
+PCT_PERMILLE = (("p50", 500), ("p90", 900), ("p99", 990), ("p99.9", 999))
 
 # Binary layout of one matched fill coming from the engine.
 # PLACEHOLDER: confirm the real layout with the IPC/engine members.
@@ -35,7 +39,8 @@ Fill = namedtuple(
 )
 SIDE_BUY, SIDE_SELL = 0, 1
 
-LatencyStats = namedtuple("LatencyStats", "last avg min max")
+# n = number of samples in the window, pct = {"p50": value or None, ...}
+LatencyStats = namedtuple("LatencyStats", "last avg min max n pct")
 Snapshot = namedtuple(
     "Snapshot",
     "book rate peak total fills fill_total latency polls clock_errors",
@@ -78,7 +83,7 @@ def build_parser():
             "examples:\n"
             "  python3 ui/dashboard.py\n"
             "  python3 ui/dashboard.py --levels 8 --refresh-ms 50\n"
-            "  python3 ui/dashboard.py --seed 42 --duration 30\n"
+            "  python3 ui/dashboard.py --window 1000 --seed 42 --duration 30\n"
             "\n"
             "keys while running:\n"
             "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live"
@@ -104,6 +109,12 @@ def build_parser():
         help=f"target orders/sec for the throughput bar (default {TARGET_OPS})",
     )
     parser.add_argument(
+        "-w", "--window", type=bounded_int(100, 100_000),
+        default=LATENCY_BUFFER, metavar="N",
+        help="rolling window: how many recent latency samples the percentiles "
+             f"use (default {LATENCY_BUFFER})",
+    )
+    parser.add_argument(
         "-m", "--mid-price", type=positive_float, default=150.0, metavar="PRICE",
         help="starting price of the mock market (default 150.0)",
     )
@@ -123,10 +134,11 @@ def build_parser():
 
 def apply_args(args):
     """Copy the launch options into the module settings the UI reads."""
-    global REFRESH_MS, LEVELS, TARGET_OPS
+    global REFRESH_MS, LEVELS, TARGET_OPS, LATENCY_BUFFER
     REFRESH_MS = args.refresh_ms
     LEVELS = args.levels
     TARGET_OPS = args.target_ops
+    LATENCY_BUFFER = args.window
     if args.seed is not None:
         random.seed(args.seed)
 
@@ -216,11 +228,14 @@ class MockEngineStream:
             price = self.book.bids[0][0] if side == SIDE_SELL else self.book.asks[0][0]
             qty = random.randint(10, 500)
 
-            # Mock engine: pretend the order entered ~25 us ago (with the
-            # odd spike) by backdating its ingress timestamp.
+            # Mock engine: pretend the order entered ~25 us ago by
+            # backdating its ingress timestamp. Spikes: 5% are 3x slower,
+            # about 0.2% are 10x slower (this is what P99.9 picks up).
             latency_us = max(1.0, random.gauss(25, 4))
             if random.random() < 0.05:
                 latency_us *= 3
+            if random.random() < 0.002:
+                latency_us *= 10
             ingress_ns = time.perf_counter_ns() - int(latency_us * 1000)
 
             raw = FILL_STRUCT.pack(
@@ -244,7 +259,7 @@ class EngineReader:
     def __init__(self, stream):
         self.stream = stream
         self.fills = deque(maxlen=FILL_BUFFER)
-        self.latencies = deque(maxlen=LATENCY_BUFFER)  # nanoseconds
+        self.latencies = deque(maxlen=LATENCY_BUFFER)  # nanoseconds, rolling
         self.fill_total = 0
         self.clock_errors = 0
 
@@ -301,12 +316,30 @@ class ThroughputMeter:
         return (c1 - c0) / dt if dt > 0 else 0.0
 
 
+def min_samples(permille):
+    """Fewest samples for a percentile to mean something (p99.9 -> 1000)."""
+    return -(-1000 // (1000 - permille))  # ceil(1000 / (1000 - permille))
+
+
+def percentile(sorted_vals, permille):
+    """Nearest-rank percentile of an already sorted list, or None if the
+    list is too short for that percentile to be meaningful."""
+    n = len(sorted_vals)
+    if n < min_samples(permille):
+        return None
+    k = (permille * n + 999) // 1000  # ceil(permille * n / 1000), whole numbers
+    return sorted_vals[k - 1]
+
+
 def latency_stats(samples_ns):
     """Latency samples in nanoseconds -> LatencyStats in microseconds."""
     if not samples_ns:
         return None
     us = [s / 1000 for s in samples_ns]
-    return LatencyStats(us[-1], sum(us) / len(us), min(us), max(us))
+    ordered = sorted(us)
+    pct = {name: percentile(ordered, pm) for name, pm in PCT_PERMILLE}
+    return LatencyStats(us[-1], sum(us) / len(us), ordered[0], ordered[-1],
+                        len(us), pct)
 
 
 class EngineWorker(threading.Thread):
@@ -336,20 +369,25 @@ class EngineWorker(threading.Thread):
             self.error = exc
 
     def snapshot(self):
-        """Copy everything the UI needs, holding the lock only briefly."""
+        """Copy what the UI needs while holding the lock, then do the heavy
+        work (sorting for percentiles) after the lock is released."""
         with self.lock:
             r = self.reader
-            return Snapshot(
-                book=BookSnapshot(list(r.book.bids), list(r.book.asks)),
-                rate=self.meter.rate,
-                peak=self.meter.peak,
-                total=self.meter.total,
-                fills=list(r.fills),
-                fill_total=r.fill_total,
-                latency=latency_stats(list(r.latencies)),
-                polls=self.polls,
-                clock_errors=r.clock_errors,
-            )
+            book = BookSnapshot(list(r.book.bids), list(r.book.asks))
+            fills = list(r.fills)
+            samples = list(r.latencies)
+            rate = self.meter.rate
+            peak = self.meter.peak
+            total = self.meter.total
+            fill_total = r.fill_total
+            polls = self.polls
+            clock_errors = r.clock_errors
+
+        return Snapshot(
+            book=book, rate=rate, peak=peak, total=total, fills=fills,
+            fill_total=fill_total, latency=latency_stats(samples),
+            polls=polls, clock_errors=clock_errors,
+        )
 
     def stop(self):
         self.stop_event.set()
@@ -461,6 +499,11 @@ def draw_book(win, book):
     win.noutrefresh()
 
 
+def fmt_pct(value):
+    """A percentile value for the panel, '--' while there are too few samples."""
+    return f"{value:>8.1f}" if value is not None else f"{'--':>8}"
+
+
 def draw_metrics(win, snap):
     draw_panel(win, "Metrics")
     h, w = win.getmaxyx()
@@ -472,19 +515,30 @@ def draw_metrics(win, snap):
     # throughput bar relative to the target
     bar_w = max(0, w - 6)
     filled = min(bar_w, int(snap.rate / TARGET_OPS * bar_w))
-    put(win, 6, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]")
-    put(win, 7, 2, f"target {TARGET_OPS:,}/s")
+    put(win, 5, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]")
+    put(win, 6, 2, f"target {TARGET_OPS:,}/s")
 
     # latency = egress_ns - ingress_ns, shown in microseconds
-    put(win, 9, 2, "Latency (us)", curses.A_BOLD)
     lat = snap.latency
     if lat is None:
-        put(win, 10, 2, "waiting for samples...")
-    else:
-        put(win, 10, 2, f"{'last':<5}{lat.last:>8.1f}{'avg':>6}{lat.avg:>8.1f}")
-        put(win, 11, 2, f"{'min':<5}{lat.min:>8.1f}{'max':>6}{lat.max:>8.1f}")
+        put(win, 8, 2, "Latency (us)", curses.A_BOLD)
+        put(win, 9, 2, "waiting for samples...")
+        win.noutrefresh()
+        return
+
+    put(win, 8, 2, f"Latency (us)  rolling n={lat.n:,}", curses.A_BOLD)
+    put(win, 9, 2, f"{'last':<5}{lat.last:>8.1f}{'avg':>6}{lat.avg:>8.1f}")
+    put(win, 10, 2, f"{'min':<5}{lat.min:>8.1f}{'max':>6}{lat.max:>8.1f}")
+    put(win, 11, 2,
+        f"{'p50':<5}{fmt_pct(lat.pct['p50'])}{'p90':>6}{fmt_pct(lat.pct['p90'])}")
+    put(win, 12, 2,
+        f"{'p99':<5}{fmt_pct(lat.pct['p99'])}{'p99.9':>6}{fmt_pct(lat.pct['p99.9'])}")
+
     if snap.clock_errors:
-        put(win, 12, 2, f"bad timestamps: {snap.clock_errors}", curses.A_REVERSE)
+        put(win, 13, 2, f"bad timestamps: {snap.clock_errors}", curses.A_REVERSE)
+    elif lat.pct["p99.9"] is None:
+        need = min_samples(999)
+        put(win, 13, 2, f"p99.9 needs {need:,} samples", curses.A_DIM)
 
     win.noutrefresh()
 
@@ -641,6 +695,10 @@ def main(stdscr, args):
     return worker.error, snap
 
 
+def pct_text(value):
+    return f"{value:.1f}" if value is not None else "--"
+
+
 if __name__ == "__main__":
     args = build_parser().parse_args()
     apply_args(args)
@@ -654,9 +712,14 @@ if __name__ == "__main__":
             f"peak {last.peak:,.0f} orders/sec, {last.fill_total:,} fills"
         )
         if last.latency:
+            lat = last.latency
             print(
-                f"Latency (us): avg {last.latency.avg:.1f}, "
-                f"min {last.latency.min:.1f}, max {last.latency.max:.1f}  "
-                f"| clock resolution {res_ns:.0f} ns, "
+                f"Latency (us) over last {lat.n:,} samples: "
+                f"avg {lat.avg:.1f}, min {lat.min:.1f}, max {lat.max:.1f}"
+            )
+            print(
+                "Percentiles (us): "
+                + ", ".join(f"{name} {pct_text(v)}" for name, v in lat.pct.items())
+                + f"  | clock resolution {res_ns:.0f} ns, "
                 f"bad timestamps {last.clock_errors}"
             )
