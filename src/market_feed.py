@@ -249,3 +249,30 @@ class MarketSimulator:
                     jittered_orders[j], jittered_orders[j + 1] = jittered_orders[j + 1], jittered_orders[j]
 
         return jittered_orders
+
+
+    def generate_iceberg_order_slice(
+        self,
+        symbol: str,
+        side: bytes,
+        total_quantity: int = 500,
+        display_size: int = 50,
+        price_offset: float = 0.0,
+    ) -> List[bytes]:
+        """Day 12 Member 3: Slices a large parent institutional order into sequential display clips."""
+        if symbol not in self.asset_prices:
+            self.asset_prices[symbol] = 100.0
+
+        base_price = self.asset_prices[symbol] + price_offset
+        now_ns = time.perf_counter_ns()
+        slices = []
+        remaining = total_quantity
+
+        while remaining > 0:
+            clip = min(display_size, remaining)
+            self.order_counter += 1
+            pkt = pack_order(self.order_counter, side, round(base_price, 2), clip, now_ns)
+            slices.append(pkt)
+            remaining -= clip
+
+        return slices

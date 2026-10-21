@@ -146,3 +146,29 @@ def test_snapshot_checkpoint_and_recovery(tmp_path):
 
     rb.close()
     lock.close()
+
+
+def test_ring_telemetry_monitor_health(tmp_path):
+    from src.ring_telemetry import RingTelemetryMonitor
+    from src.ring_buffer import MmapRingBuffer
+    from src.ipc_sync import MmapProcessLock
+    from src.schema import pack_order
+
+    buf_path = str(tmp_path / "telem.bin")
+    lock_path = str(tmp_path / "telem.lock")
+
+    rb = MmapRingBuffer(buf_path, capacity=64, create=True)
+    lock = MmapProcessLock(lock_path, create=True)
+    monitor = RingTelemetryMonitor(rb, lock, sample_window=10)
+
+    now = time.perf_counter_ns()
+    pkts = [pack_order(i, b"B", 100.0, 10, now) for i in range(1, 16)]
+    rb.write_batch(pkts)
+
+    health = monitor.sample_health()
+    assert health["unconsumed"] == 15
+    assert health["occupancy_pct"] > 0.0
+    assert health["healthy"] is True
+
+    rb.close()
+    lock.close()

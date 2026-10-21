@@ -111,3 +111,13 @@ def test_jittered_packet_generation():
     timestamps = [unpack_order(p).timestamp_ns for p in jittered]
     # Check that timestamps have microsecond dispersion
     assert len(set(timestamps)) > 1
+
+
+def test_iceberg_order_slicing():
+    sim = MarketSimulator(symbols=["AAPL"])
+    slices = sim.generate_iceberg_order_slice("AAPL", side=b"B", total_quantity=250, display_size=50)
+
+    assert len(slices) == 5
+    total_qty = sum(unpack_order(p).quantity for p in slices)
+    assert total_qty == 250
+    assert all(unpack_order(p).side == b"B" for p in slices)
