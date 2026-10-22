@@ -172,3 +172,27 @@ def test_ring_telemetry_monitor_health(tmp_path):
 
     rb.close()
     lock.close()
+
+
+def test_binary_wal_persistence_and_replay(tmp_path):
+    from src.wal import BinaryWALWriter, BinaryWALReader
+    from src.schema import pack_order, unpack_order
+
+    wal_file = str(tmp_path / "chronos_test.wal")
+    writer = BinaryWALWriter(wal_file)
+
+    now = time.perf_counter_ns()
+    orders = [pack_order(i, b"B", 200.0 + i, 10, now) for i in range(1, 16)]
+    written_count = writer.append_batch(orders)
+    writer.close()
+    assert written_count == 15
+
+    reader = BinaryWALReader(wal_file)
+    replayed = list(reader.replay_records())
+    assert len(replayed) == 15
+
+    # Verify first and last records match exactly
+    seq_1, raw_1 = replayed[0]
+    seq_15, raw_15 = replayed[14]
+    assert seq_1 == 1 and unpack_order(raw_1).order_id == 1
+    assert seq_15 == 15 and unpack_order(raw_15).order_id == 15

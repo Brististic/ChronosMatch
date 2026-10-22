@@ -276,3 +276,57 @@ class MarketSimulator:
             remaining -= clip
 
         return slices
+
+
+    def generate_l3_lifecycle_stream(
+        self,
+        symbol: str,
+        events_count: int = 40,
+    ) -> List[Tuple[str, bytes]]:
+        """Day 13 Member 3: Generates Level-3 order lifecycle state transitions: ADD, MODIFY, CANCEL, EXECUTE."""
+        if symbol not in self.asset_prices:
+            self.asset_prices[symbol] = 150.0
+
+        base_px = self.asset_prices[symbol]
+        active_orders = {}
+        events: List[Tuple[str, bytes]] = []
+        now_ns = time.perf_counter_ns()
+
+        for _ in range(events_count):
+            action_roll = random.random()
+
+            if action_roll < 0.50 or not active_orders:
+                # 1. ADD new order
+                self.order_counter += 1
+                oid = self.order_counter
+                side = b"B" if random.random() < 0.5 else b"S"
+                px = round(base_px + random.uniform(-0.50, 0.50), 2)
+                qty = random.randint(10, 100)
+                active_orders[oid] = {"side": side, "price": px, "qty": qty}
+                pkt = pack_order(oid, side, px, qty, now_ns)
+                events.append(("ADD", pkt))
+
+            elif action_roll < 0.75:
+                # 2. MODIFY active order (Size or Price adjustment)
+                oid = random.choice(list(active_orders.keys()))
+                meta = active_orders[oid]
+                meta["qty"] = max(1, meta["qty"] + random.randint(-5, 10))
+                meta["price"] = round(meta["price"] + random.uniform(-0.05, 0.05), 2)
+                pkt = pack_order(oid, meta["side"], meta["price"], meta["qty"], now_ns)
+                events.append(("MODIFY", pkt))
+
+            elif action_roll < 0.90:
+                # 3. CANCEL active order
+                oid = random.choice(list(active_orders.keys()))
+                meta = active_orders.pop(oid)
+                pkt = pack_order(oid, meta["side"], meta["price"], 0, now_ns)  # Qty 0 = Cancel
+                events.append(("CANCEL", pkt))
+
+            else:
+                # 4. EXECUTE active order
+                oid = random.choice(list(active_orders.keys()))
+                meta = active_orders.pop(oid)
+                pkt = pack_order(oid, meta["side"], meta["price"], meta["qty"], now_ns)
+                events.append(("EXECUTE", pkt))
+
+        return events

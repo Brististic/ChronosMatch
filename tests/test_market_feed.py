@@ -121,3 +121,15 @@ def test_iceberg_order_slicing():
     total_qty = sum(unpack_order(p).quantity for p in slices)
     assert total_qty == 250
     assert all(unpack_order(p).side == b"B" for p in slices)
+
+
+def test_level3_order_lifecycle_stream():
+    sim = MarketSimulator(symbols=["TSLA"])
+    events = sim.generate_l3_lifecycle_stream("TSLA", events_count=30)
+
+    assert len(events) == 30
+    actions = {action for action, _ in events}
+    assert "ADD" in actions  # Must at least generate ADD events
+    for action, raw_pkt in events:
+        assert action in ("ADD", "MODIFY", "CANCEL", "EXECUTE")
+        assert len(raw_pkt) == 29
