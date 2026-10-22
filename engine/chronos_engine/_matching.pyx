@@ -43,7 +43,7 @@ from chronos_engine.order_book cimport (
     Book, BookSide, BOOK_OK, BOOK_ERR_DUPLICATE, BOOK_ERR_INVALID,
     BOOK_ERR_NOMEM, BOOK_ERR_NOT_FOUND, BOOK_ERR_RANGE, BOOK_ERR_FULL,
     book_init, book_destroy, book_insert, book_cancel, book_check,
-    side_best, side_next, side_find_tick, price_to_tick, idmap_find, IdEntry,
+    side_best, side_next, side_find_tick, price_to_tick, tick_crosses, idmap_find, IdEntry, order_is_valid,
 )
 from chronos_engine.matching cimport (
     Fill, FillBuffer, SubmitSummary, fillbuf_init, fillbuf_free, fillbuf_clear,
@@ -553,6 +553,124 @@ cdef class OrderBook:
             fillbuf_free(&fills)
         self._raise_for(rc)
         return out
+
+    def submit_to_outbound_ring(self, unsigned long long order_id, bytes side,
+                                double price, unsigned int quantity,
+                                unsigned long long timestamp_ns,
+                                unsigned char[::1] ring):
+        """Match one order and publish complete 53-byte audit fills to a writable
+        Member-1-style mmap ring (24-byte <IIIIQ header, slot_size=53).
+
+        Wire fill format: <QQQdIIIQB = trade_id, taker_id, maker_id, price,
+        quantity, taker_remaining, maker_remaining, timestamp_ns, taker_side.
+        The ring must be single-producer/single-consumer and the consumer must
+        only advance tail after copying a complete slot. If the ring lacks room
+        for every potential fill, BufferError is raised BEFORE the book changes.
+        This method creates no Python fill tuples/lists; fills are staged in a
+        preallocated C array and copied into mmap slots before head is published.
+        """
+        cdef Order order
+        cdef FillBuffer fills
+        cdef SubmitSummary summary
+        cdef BookSide* opposite
+        cdef PriceLevel* lvl
+        cdef OrderNode* node
+        cdef Fill* f
+        cdef unsigned char* raw = &ring[0]
+        cdef unsigned char* raw_slot
+        cdef uint32_t head, tail, cap, slot_size, drops
+        cdef uint32_t occupied, free_slots, needed = 0
+        cdef uint32_t pre_remaining, pre_traded
+        cdef uint32_t new_head
+        cdef uint32_t i
+        cdef Py_ssize_t expected_size
+        cdef int64_t order_tick
+        cdef int rc = BOOK_OK
+        cdef int gil_state = -1
+        if len(side) != 1:
+            raise ValueError("side must be b'B' or b'S'")
+        if ring.shape[0] < 24:
+            raise ValueError("outbound ring buffer is shorter than its 24-byte header")
+        order.order_id = order_id
+        order.timestamp_ns = timestamp_ns
+        order.price = price
+        order.quantity = quantity
+        order.side = side[0]
+
+        # Member 1 header: little-endian <IIIIQ at byte offsets 0,4,8,12,16.
+        memcpy(&head, raw + 0, sizeof(uint32_t))
+        memcpy(&tail, raw + 4, sizeof(uint32_t))
+        memcpy(&cap, raw + 8, sizeof(uint32_t))
+        memcpy(&slot_size, raw + 12, sizeof(uint32_t))
+        memcpy(&drops, raw + 16, sizeof(uint32_t))
+        if cap < 2 or slot_size != 53:
+            raise ValueError("outbound ring must have capacity >= 2 and slot_size=53")
+        expected_size = 24 + <Py_ssize_t>cap * slot_size
+        if ring.shape[0] < expected_size:
+            raise ValueError("outbound ring mapping is smaller than header capacity requires")
+        if head >= cap or tail >= cap:
+            raise ValueError("outbound ring header has invalid head/tail")
+
+        fillbuf_init(&fills)
+        self._acquire()
+        try:
+            # Count all makers the order would cross while book is locked. This
+            # makes ring-full rejection atomic with respect to book mutation.
+            if order_is_valid(&order) and price_to_tick(&self._book, price, &order_tick) and \
+                    idmap_find(&self._book.ids, order_id) == NULL:
+                opposite = &self._book.asks if order.side == SIDE_BUY else &self._book.bids
+                pre_remaining = order.quantity
+                lvl = side_best(opposite)
+                while pre_remaining > 0 and lvl != NULL and tick_crosses(order.side, order_tick, lvl.tick):
+                    node = lvl.head
+                    while pre_remaining > 0 and node != NULL:
+                        pre_traded = pre_remaining if pre_remaining < node.order.quantity else node.order.quantity
+                        pre_remaining -= pre_traded
+                        needed += 1
+                        node = node.next
+                    lvl = side_next(opposite, lvl)
+
+            if head >= tail:
+                occupied = head - tail
+            else:
+                occupied = cap - (tail - head)
+            free_slots = (cap - 1) - occupied
+            if needed > free_slots:
+                raise BufferError("outbound fill ring has insufficient free slots; order not submitted")
+            if needed > 0 and fillbuf_prealloc(&fills, needed) != BOOK_OK:
+                raise MemoryError("could not preallocate C fill staging buffer")
+
+            with nogil:
+                gil_state = PyGILState_Check()
+                rc = book_submit_ex(&self._book, &order, &fills, &summary)
+            self._gil_probe = gil_state
+
+            # Serialize directly into mapped ring slots. No Python bytes/tuple
+            # is constructed for an individual fill.
+            new_head = head
+            for i in range(fills.count):
+                f = &fills.items[i]
+                raw_slot = raw + 24 + <Py_ssize_t>new_head * slot_size
+                memcpy(raw_slot + 0, &f.trade_id, 8)
+                memcpy(raw_slot + 8, &f.taker_id, 8)
+                memcpy(raw_slot + 16, &f.maker_id, 8)
+                memcpy(raw_slot + 24, &f.price, 8)
+                memcpy(raw_slot + 32, &f.quantity, 4)
+                memcpy(raw_slot + 36, &f.taker_remaining, 4)
+                memcpy(raw_slot + 40, &f.maker_remaining, 4)
+                memcpy(raw_slot + 44, &f.timestamp_ns, 8)
+                raw_slot[52] = f.taker_side
+                new_head = (new_head + 1) % cap
+            # Publish head only after every slot payload has been copied.
+            memcpy(raw + 0, &new_head, sizeof(uint32_t))
+        finally:
+            self._release()
+            fillbuf_free(&fills)
+        self._raise_for(rc)
+        return {"fill_count": summary.fill_count,
+                "filled_quantity": summary.filled_quantity,
+                "resting_quantity": summary.resting_quantity,
+                "head": new_head}
 
     def submit_traced(self, unsigned long long order_id, bytes side, double price,
                       unsigned int quantity, unsigned long long timestamp_ns=0):

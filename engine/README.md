@@ -64,3 +64,32 @@ book.pool_stats()      # capacity, in_use, peak, slabs, system_allocations for b
   `grow=False` makes the pools strictly fixed: new orders then raise `MemoryError` (counted as rejected on the ring path).
 - `CHRONOS_DEBUG=1 python setup.py build_ext --inplace` builds a debug version that fills freed pool elements with 0xDD.
 - `bench_latency()` reports the per-operation latency distribution (p50 / p99 / p99.9 / max).
+
+## Day 13 — outbound fill ring
+
+`OrderBook.submit_to_outbound_ring(..., ring)` publishes matching executions to
+an outbound mmap ring using Member 1's 24-byte `<IIIIQ` header. Configure that
+ring with `slot_size=53`. The execution wire slot is `<QQQdIIIQB` (53 bytes):
+
+1. `trade_id` (uint64)
+2. `taker_id` (uint64)
+3. `maker_id` (uint64)
+4. execution `price` (float64)
+5. `quantity`, `taker_remaining`, `maker_remaining` (uint32 each)
+6. `timestamp_ns` (uint64)
+7. `taker_side` (ASCII `B` or `S`)
+
+The method counts potential fills while holding the book mutex and raises
+`BufferError` before matching if the ring cannot hold them. It uses a preallocated
+C `FillBuffer` (no per-fill Python tuples/lists), serializes the records into mmap
+slots, and updates `head` only after payload writes. `chronos_engine.fill_wire`
+contains a consumer/test decoder; it is not called by the engine hot path.
+
+**Integration contract:** use one producer for this outbound ring; the consumer
+must copy a complete slot before advancing `tail`. Member 1's current Python ring
+implementation does not itself provide cross-process atomic publication/locking,
+so deployments with concurrent processes should use the project's IPC sync/lock
+layer around header access or upgrade the shared ring's synchronization. The
+engine method expects a writable contiguous mapping, capacity >= 2, and 53-byte
+slots. On the little-endian Windows/Linux targets, the wire fields match the
+specified little-endian layout.
