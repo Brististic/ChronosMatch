@@ -4,9 +4,10 @@ import random
 import struct
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from collections import deque, namedtuple
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
@@ -20,7 +21,12 @@ MAX_QTY = 2000
 FILL_BUFFER = 500      # how many recent fills the UI keeps
 
 MIN_H, MIN_W = 28, 70  # smallest terminal the layout fits in
+WIDE_W = 110           # at this width the histogram sits next to the log
+LOG_W = 66             # width of the trade log in the wide layout
 PAGE = 10              # lines moved by PgUp / PgDn
+
+HIST_MAX_BINS = 20     # most rows the histogram will use
+HIST_LO_FLOOR_US = 0.1 # lowest edge of the log-scale histogram
 
 # Percentiles shown in the Metrics panel, in permille (per 1000) so the
 # maths stays in whole numbers: 999 = 99.9th percentile.
@@ -39,8 +45,9 @@ Fill = namedtuple(
 )
 SIDE_BUY, SIDE_SELL = 0, 1
 
-# n = number of samples in the window, pct = {"p50": value or None, ...}
-LatencyStats = namedtuple("LatencyStats", "last avg min max n pct")
+# n = samples in the window, pct = {"p50": value or None, ...},
+# ordered = all window samples in microseconds, sorted (feeds the histogram)
+LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered")
 Snapshot = namedtuple(
     "Snapshot",
     "book rate peak total fills fill_total latency polls clock_errors",
@@ -86,7 +93,9 @@ def build_parser():
             "  python3 ui/dashboard.py --window 1000 --seed 42 --duration 30\n"
             "\n"
             "keys while running:\n"
-            "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live"
+            "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live\n"
+            "  h switch the bottom panel between log and histogram (narrow "
+            "terminals)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -112,7 +121,7 @@ def build_parser():
         "-w", "--window", type=bounded_int(100, 100_000),
         default=LATENCY_BUFFER, metavar="N",
         help="rolling window: how many recent latency samples the percentiles "
-             f"use (default {LATENCY_BUFFER})",
+             f"and histogram use (default {LATENCY_BUFFER})",
     )
     parser.add_argument(
         "-m", "--mid-price", type=positive_float, default=150.0, metavar="PRICE",
@@ -339,7 +348,42 @@ def latency_stats(samples_ns):
     ordered = sorted(us)
     pct = {name: percentile(ordered, pm) for name, pm in PCT_PERMILLE}
     return LatencyStats(us[-1], sum(us) / len(us), ordered[0], ordered[-1],
-                        len(us), pct)
+                        len(us), pct, ordered)
+
+
+def histogram(ordered, bins):
+    """Log-spaced histogram of a sorted list.
+
+    Returns (edges, counts): bin i covers edges[i] up to edges[i + 1].
+    Each bin is wider than the one before it, so a long latency tail still
+    fits on screen. The counts always add up to len(ordered).
+    """
+    n = len(ordered)
+    if n == 0 or bins < 1:
+        return [], []
+
+    lo = max(ordered[0], HIST_LO_FLOOR_US)
+    hi = ordered[-1]
+    if bins == 1 or hi <= lo * 1.001:  # everything is (nearly) the same value
+        return [lo, max(hi, lo)], [n]
+
+    ratio = hi / lo
+    edges = [lo * ratio ** (i / bins) for i in range(bins + 1)]
+    edges[-1] = hi
+
+    counts = []
+    prev = 0
+    for i in range(bins):
+        idx = n if i == bins - 1 else bisect_left(ordered, edges[i + 1])
+        counts.append(idx - prev)
+        prev = idx
+    return edges, counts
+
+
+def bin_of(edges, value):
+    """Index of the histogram bin that a value falls into."""
+    i = bisect_right(edges, value) - 1
+    return min(max(i, 0), len(edges) - 2)
 
 
 class EngineWorker(threading.Thread):
@@ -436,7 +480,11 @@ def put(win, y, x, text, attr=0):
 
 
 def build_windows(stdscr):
-    """Create the sub-windows for the current size, or None if too small."""
+    """Create the sub-windows for the current size, or None if too small.
+
+    Wide terminals get the log and the histogram side by side. Narrow ones
+    get both windows on the same spot and show one at a time (key: h).
+    """
     h, w = stdscr.getmaxyx()
     if h < MIN_H or w < MIN_W:
         return None
@@ -446,15 +494,24 @@ def build_windows(stdscr):
     top_h = body_h * 6 // 10
     log_h = body_h - top_h
     left_w = w // 2
+    y = header_h + top_h
+    wide = w >= WIDE_W
 
     try:
-        return {
+        wins = {
             "header": curses.newwin(header_h, w, 0, 0),
             "book": curses.newwin(top_h, left_w, header_h, 0),
             "metrics": curses.newwin(top_h, w - left_w, header_h, left_w),
-            "log": curses.newwin(log_h, w, header_h + top_h, 0),
             "footer": curses.newwin(footer_h, w, h - 1, 0),
+            "wide": wide,
         }
+        if wide:
+            wins["log"] = curses.newwin(log_h, LOG_W, y, 0)
+            wins["hist"] = curses.newwin(log_h, w - LOG_W, y, LOG_W)
+        else:
+            wins["log"] = curses.newwin(log_h, w, y, 0)
+            wins["hist"] = curses.newwin(log_h, w, y, 0)
+        return wins
     except curses.error:
         return None
 
@@ -543,6 +600,66 @@ def draw_metrics(win, snap):
     win.noutrefresh()
 
 
+def draw_hist(win, snap):
+    """Live histogram of the rolling latency window, with percentile tags."""
+    draw_panel(win, "Latency Histogram (us)")
+    h, w = win.getmaxyx()
+
+    lat = snap.latency
+    if lat is None:
+        put(win, 2, 2, "waiting for samples...")
+        win.noutrefresh()
+        return
+
+    rows = h - 3  # row 1 = subtitle, rows 2.. = bins, last row = border
+    if rows < 1:
+        win.noutrefresh()
+        return
+
+    edges, counts = histogram(lat.ordered, min(rows, HIST_MAX_BINS))
+
+    # which percentiles fall into which bin
+    tags = [[] for _ in counts]
+    for name, value in lat.pct.items():
+        if value is not None:
+            tags[bin_of(edges, value)].append(name)
+
+    put(win, 1, 2, f"n={lat.n:,}  log scale  # = count", curses.A_BOLD)
+
+    prefix_w = 2 + 13 + 7   # x offset + label + count columns
+    tag_w = 11
+    bar_w = max(0, w - prefix_w - tag_w - 1)
+    biggest = max(counts) or 1
+
+    for i, c in enumerate(counts):
+        label = f"{edges[i]:>6.1f}-{edges[i + 1]:<6.1f}"
+        bar = ""
+        if c > 0:
+            bar = "#" * max(1, round(c / biggest * bar_w))
+        tag_text = "/".join(tags[i])
+        line = f"{label} {c:>5} {bar:<{bar_w}} {tag_text}"
+        if tags[i]:
+            attr = curses.A_BOLD
+        elif c == 0:
+            attr = curses.A_DIM
+        else:
+            attr = 0
+        put(win, 2 + i, 2, line, attr)
+
+    win.noutrefresh()
+
+
+def print_histogram(lat, bins=10, width=40):
+    """Plain-text histogram for the end-of-run summary."""
+    edges, counts = histogram(lat.ordered, bins)
+    if not counts:
+        return
+    biggest = max(counts) or 1
+    for i, c in enumerate(counts):
+        bar = "#" * (max(1, round(c / biggest * width)) if c else 0)
+        print(f"{edges[i]:>8.1f}-{edges[i + 1]:<8.1f} {c:>6}  {bar}")
+
+
 def fmt_time(ts_ns):
     """Nanosecond timestamp -> HH:MM:SS.mmm in local time."""
     secs = ts_ns // 1_000_000_000
@@ -592,7 +709,7 @@ def draw_log(win, snap, view):
     win.noutrefresh()
 
 
-def draw(wins, snap, view, stats_text):
+def draw(wins, snap, view, stats_text, bottom):
     h, w = wins["header"].getmaxyx()
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
@@ -601,11 +718,20 @@ def draw(wins, snap, view, stats_text):
 
     draw_book(wins["book"], snap.book)
     draw_metrics(wins["metrics"], snap)
-    draw_log(wins["log"], snap, view)
+
+    if wins["wide"]:
+        draw_log(wins["log"], snap, view)
+        draw_hist(wins["hist"], snap)
+        footer = "q: quit   Up/Down PgUp/PgDn: scroll log   f/End: follow"
+    else:
+        if bottom == "hist":
+            draw_hist(wins["hist"], snap)
+        else:
+            draw_log(wins["log"], snap, view)
+        footer = "q: quit  Up/Down PgUp/PgDn: scroll log  f: follow  h: log/histogram"
 
     wins["footer"].erase()
-    put(wins["footer"], 0, 1,
-        "q: quit   Up/Down: scroll log   PgUp/PgDn: page   f/End: follow")
+    put(wins["footer"], 0, 1, footer)
     wins["footer"].noutrefresh()
 
     curses.doupdate()
@@ -639,6 +765,7 @@ def main(stdscr, args):
     size = stdscr.getmaxyx()
     wins = build_windows(stdscr)
     view = LogView()
+    bottom = "log"  # which panel a narrow terminal shows: "log" or "hist"
 
     worker = EngineWorker(EngineReader(make_stream(args)))
     worker.start()
@@ -668,7 +795,7 @@ def main(stdscr, args):
                 draw_too_small(stdscr)
             else:
                 stats_text = f"UI {fps:4.1f} fps | engine {poll_rate:,.0f} polls/s"
-                draw(wins, snap, view, stats_text)
+                draw(wins, snap, view, stats_text, bottom)
 
             if args.duration is not None and now - start_t >= args.duration:
                 break
@@ -686,6 +813,8 @@ def main(stdscr, args):
                 view.scroll(-PAGE)
             elif key in (ord("f"), ord("F"), curses.KEY_END):
                 view.resume()
+            elif key in (ord("h"), ord("H")):
+                bottom = "hist" if bottom == "log" else "log"
             # KEY_RESIZE is the normal signal, the size check is a safety net
             if key == curses.KEY_RESIZE or stdscr.getmaxyx() != size:
                 wins, size = handle_resize(stdscr)
@@ -723,3 +852,5 @@ if __name__ == "__main__":
                 + f"  | clock resolution {res_ns:.0f} ns, "
                 f"bad timestamps {last.clock_errors}"
             )
+            print("Latency histogram (us, log scale):")
+            print_histogram(lat)
