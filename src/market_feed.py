@@ -330,3 +330,41 @@ class MarketSimulator:
                 events.append(("EXECUTE", pkt))
 
         return events
+
+
+    def generate_arbitrage_pair_burst(
+        self,
+        sym_a: str,
+        sym_b: str,
+        hedge_ratio: float = 1.0,
+        spread_threshold: float = 0.40,
+    ) -> Dict[str, List[bytes]]:
+        """Day 14 Member 3: Emits correlated two-legged arbitrage order pairs when the price spread diverges."""
+        if sym_a not in self.asset_prices:
+            self.asset_prices[sym_a] = 180.0
+        if sym_b not in self.asset_prices:
+            self.asset_prices[sym_b] = 180.0
+
+        px_a = self.asset_prices[sym_a]
+        px_b = self.asset_prices[sym_b]
+        synthetic_spread = px_a - (hedge_ratio * px_b)
+        now_ns = time.perf_counter_ns()
+
+        orders_a: List[bytes] = []
+        orders_b: List[bytes] = []
+
+        # If spread diverges beyond threshold, trigger simultaneous buy/sell pairs
+        if abs(synthetic_spread) >= spread_threshold:
+            self.order_counter += 1
+            if synthetic_spread > 0:
+                # sym_a is rich (Sell A), sym_b is cheap (Buy B)
+                orders_a.append(pack_order(self.order_counter, b"S", px_a, 50, now_ns))
+                self.order_counter += 1
+                orders_b.append(pack_order(self.order_counter, b"B", px_b, int(50 * hedge_ratio), now_ns))
+            else:
+                # sym_a is cheap (Buy A), sym_b is rich (Sell B)
+                orders_a.append(pack_order(self.order_counter, b"B", px_a, 50, now_ns))
+                self.order_counter += 1
+                orders_b.append(pack_order(self.order_counter, b"S", px_b, int(50 * hedge_ratio), now_ns))
+
+        return {sym_a: orders_a, sym_b: orders_b}

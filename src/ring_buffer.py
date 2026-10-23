@@ -146,3 +146,27 @@ class MmapRingBuffer:
         if self.total_size != HEADER_SIZE + (cap * size):
             return False
         return True
+
+    def compact_ring_buffer(self, lock) -> int:
+        """Day 14 Member 1: Compacts active unconsumed messages to index 0 and realigns head/tail counters."""
+        with lock:
+            head, tail, capacity, slot_size, drops = self._read_header()
+            unconsumed = (head - tail) % capacity
+            if unconsumed == 0:
+                self._write_header(0, 0, capacity, slot_size, 0)
+                return 0
+
+            # Linearize and pack unconsumed items contiguous from slot 0
+            compacted_data = bytearray()
+            for i in range(unconsumed):
+                idx = (tail + i) % capacity
+                offset = HEADER_SIZE + (idx * slot_size)
+                compacted_data.extend(self._buf[offset : offset + slot_size])
+
+            # Write back starting at slot 0
+            dest_offset = HEADER_SIZE
+            self._buf[dest_offset : dest_offset + len(compacted_data)] = compacted_data
+
+            # Reset head to unconsumed count and tail to 0
+            self._write_header(unconsumed, 0, capacity, slot_size, 0)
+            return unconsumed

@@ -133,3 +133,21 @@ def test_level3_order_lifecycle_stream():
     for action, raw_pkt in events:
         assert action in ("ADD", "MODIFY", "CANCEL", "EXECUTE")
         assert len(raw_pkt) == 29
+
+
+def test_cross_asset_arbitrage_generation():
+    sim = MarketSimulator(symbols=["AAPL", "MSFT"])
+    sim.asset_prices["AAPL"] = 185.0
+    sim.asset_prices["MSFT"] = 180.0  # Spread = +$5.00 (> $0.40 threshold)
+
+    arb_orders = sim.generate_arbitrage_pair_burst("AAPL", "MSFT", spread_threshold=0.40)
+    assert len(arb_orders["AAPL"]) == 1
+    assert len(arb_orders["MSFT"]) == 1
+
+    order_a = unpack_order(arb_orders["AAPL"][0])
+    order_b = unpack_order(arb_orders["MSFT"][0])
+
+    # AAPL was overvalued -> should generate Sell
+    assert order_a.side == b"S"
+    # MSFT was undervalued -> should generate Buy
+    assert order_b.side == b"B"
