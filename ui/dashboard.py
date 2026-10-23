@@ -7,7 +7,7 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import deque, namedtuple
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
@@ -15,13 +15,18 @@ LEVELS = 5             # price levels shown per side
 TARGET_OPS = 100_000   # target throughput from the project plan
 LATENCY_BUFFER = 5000  # rolling window: how many latency samples are kept
 
+# SLA: a trade breaches it when its latency is strictly greater than this.
+SLA_NS = 50_000        # in nanoseconds (flag: --sla-us)
+SLA_US = SLA_NS / 1000 # the same limit in microseconds
+FLASH_S = 1.5          # how long the breach alert flashes after a breach
+
 WORKER_SLEEP = 0.001   # engine consumer loop pause
 TICK = 0.01            # price step between levels
 MAX_QTY = 2000
 FILL_BUFFER = 500      # how many recent fills the UI keeps
 
 MIN_H, MIN_W = 28, 70  # smallest terminal the layout fits in
-WIDE_W = 110           # at this width the histogram sits next to the log
+WIDE_W = 120           # at this width the histogram sits next to the log
 LOG_W = 66             # width of the trade log in the wide layout
 PAGE = 10              # lines moved by PgUp / PgDn
 
@@ -46,11 +51,13 @@ Fill = namedtuple(
 SIDE_BUY, SIDE_SELL = 0, 1
 
 # n = samples in the window, pct = {"p50": value or None, ...},
-# ordered = all window samples in microseconds, sorted (feeds the histogram)
-LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered")
+# ordered = all window samples in microseconds, sorted (feeds the histogram),
+# over = how many window samples are above the SLA
+LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered over")
 Snapshot = namedtuple(
     "Snapshot",
-    "book rate peak total fills fill_total latency polls clock_errors",
+    "book rate peak total fills fill_total latency polls clock_errors "
+    "sla_checked sla_breaches breach_age",
 )
 
 
@@ -90,7 +97,7 @@ def build_parser():
             "examples:\n"
             "  python3 ui/dashboard.py\n"
             "  python3 ui/dashboard.py --levels 8 --refresh-ms 50\n"
-            "  python3 ui/dashboard.py --window 1000 --seed 42 --duration 30\n"
+            "  python3 ui/dashboard.py --sla-us 30 --seed 42 --duration 30\n"
             "\n"
             "keys while running:\n"
             "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live\n"
@@ -124,6 +131,11 @@ def build_parser():
              f"and histogram use (default {LATENCY_BUFFER})",
     )
     parser.add_argument(
+        "--sla-us", type=positive_float, default=SLA_US, metavar="US",
+        help="SLA threshold in microseconds; a trade slower than this is "
+             f"flagged as a breach (default {SLA_US:g})",
+    )
+    parser.add_argument(
         "-m", "--mid-price", type=positive_float, default=150.0, metavar="PRICE",
         help="starting price of the mock market (default 150.0)",
     )
@@ -143,11 +155,13 @@ def build_parser():
 
 def apply_args(args):
     """Copy the launch options into the module settings the UI reads."""
-    global REFRESH_MS, LEVELS, TARGET_OPS, LATENCY_BUFFER
+    global REFRESH_MS, LEVELS, TARGET_OPS, LATENCY_BUFFER, SLA_NS, SLA_US
     REFRESH_MS = args.refresh_ms
     LEVELS = args.levels
     TARGET_OPS = args.target_ops
     LATENCY_BUFFER = args.window
+    SLA_NS = int(round(args.sla_us * 1000))
+    SLA_US = SLA_NS / 1000
     if args.seed is not None:
         random.seed(args.seed)
 
@@ -238,10 +252,10 @@ class MockEngineStream:
             qty = random.randint(10, 500)
 
             # Mock engine: pretend the order entered ~25 us ago by
-            # backdating its ingress timestamp. Spikes: 5% are 3x slower,
-            # about 0.2% are 10x slower (this is what P99.9 picks up).
+            # backdating its ingress timestamp. Spikes: 2% are 3x slower
+            # (about 75 us, an SLA breach), about 0.2% are 10x slower.
             latency_us = max(1.0, random.gauss(25, 4))
-            if random.random() < 0.05:
+            if random.random() < 0.02:
                 latency_us *= 3
             if random.random() < 0.002:
                 latency_us *= 10
@@ -271,6 +285,9 @@ class EngineReader:
         self.latencies = deque(maxlen=LATENCY_BUFFER)  # nanoseconds, rolling
         self.fill_total = 0
         self.clock_errors = 0
+        self.sla_checked = 0        # fills with a valid latency
+        self.sla_breaches = 0       # of those, how many exceeded the SLA
+        self.last_breach_t = None   # perf_counter() time of the latest breach
 
     @property
     def book(self):
@@ -292,6 +309,10 @@ class EngineReader:
                 latency_ns = None
             else:
                 self.latencies.append(latency_ns)
+                self.sla_checked += 1
+                if latency_ns > SLA_NS:
+                    self.sla_breaches += 1
+                    self.last_breach_t = time.perf_counter()
 
             self.fills.append(Fill(*rf, egress_ns, latency_ns))
             self.fill_total += 1
@@ -347,8 +368,9 @@ def latency_stats(samples_ns):
     us = [s / 1000 for s in samples_ns]
     ordered = sorted(us)
     pct = {name: percentile(ordered, pm) for name, pm in PCT_PERMILLE}
+    over = len(ordered) - bisect_right(ordered, SLA_US)  # strictly above
     return LatencyStats(us[-1], sum(us) / len(us), ordered[0], ordered[-1],
-                        len(us), pct, ordered)
+                        len(us), pct, ordered, over)
 
 
 def histogram(ordered, bins):
@@ -384,6 +406,15 @@ def bin_of(edges, value):
     """Index of the histogram bin that a value falls into."""
     i = bisect_right(edges, value) - 1
     return min(max(i, 0), len(edges) - 2)
+
+
+def breach_state(snap):
+    """(flashing, on): is the breach alert active, and is this frame the
+    'lit' half of the flash? The flash toggles four times a second."""
+    age = snap.breach_age
+    if age is None or age > FLASH_S:
+        return False, False
+    return True, int(age * 4) % 2 == 0
 
 
 class EngineWorker(threading.Thread):
@@ -426,11 +457,19 @@ class EngineWorker(threading.Thread):
             fill_total = r.fill_total
             polls = self.polls
             clock_errors = r.clock_errors
+            sla_checked = r.sla_checked
+            sla_breaches = r.sla_breaches
+            last_breach_t = r.last_breach_t
+
+        age = None
+        if last_breach_t is not None:
+            age = time.perf_counter() - last_breach_t
 
         return Snapshot(
             book=book, rate=rate, peak=peak, total=total, fills=fills,
             fill_total=fill_total, latency=latency_stats(samples),
-            polls=polls, clock_errors=clock_errors,
+            polls=polls, clock_errors=clock_errors, sla_checked=sla_checked,
+            sla_breaches=sla_breaches, breach_age=age,
         )
 
     def stop(self):
@@ -570,26 +609,42 @@ def draw_metrics(win, snap):
     put(win, 4, 2, f"{'Total':<12}{snap.total:>14,}")
 
     # throughput bar relative to the target
-    bar_w = max(0, w - 6)
+    suffix = f" {TARGET_OPS:,}/s"
+    bar_w = max(0, w - 6 - len(suffix))
     filled = min(bar_w, int(snap.rate / TARGET_OPS * bar_w))
-    put(win, 5, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]")
-    put(win, 6, 2, f"target {TARGET_OPS:,}/s")
+    put(win, 5, 2, "[" + "#" * filled + "." * (bar_w - filled) + "]" + suffix)
 
     # latency = egress_ns - ingress_ns, shown in microseconds
     lat = snap.latency
     if lat is None:
-        put(win, 8, 2, "Latency (us)", curses.A_BOLD)
-        put(win, 9, 2, "waiting for samples...")
+        put(win, 6, 2, "Latency (us)", curses.A_BOLD)
+        put(win, 7, 2, "waiting for samples...")
         win.noutrefresh()
         return
 
-    put(win, 8, 2, f"Latency (us)  rolling n={lat.n:,}", curses.A_BOLD)
-    put(win, 9, 2, f"{'last':<5}{lat.last:>8.1f}{'avg':>6}{lat.avg:>8.1f}")
-    put(win, 10, 2, f"{'min':<5}{lat.min:>8.1f}{'max':>6}{lat.max:>8.1f}")
-    put(win, 11, 2,
+    put(win, 6, 2, f"Latency (us)  rolling n={lat.n:,}", curses.A_BOLD)
+    put(win, 7, 2, f"{'last':<5}{lat.last:>8.1f}{'avg':>6}{lat.avg:>8.1f}")
+    put(win, 8, 2, f"{'min':<5}{lat.min:>8.1f}{'max':>6}{lat.max:>8.1f}")
+    put(win, 9, 2,
         f"{'p50':<5}{fmt_pct(lat.pct['p50'])}{'p90':>6}{fmt_pct(lat.pct['p90'])}")
-    put(win, 12, 2,
+    put(win, 10, 2,
         f"{'p99':<5}{fmt_pct(lat.pct['p99'])}{'p99.9':>6}{fmt_pct(lat.pct['p99.9'])}")
+
+    # SLA counter and flashing alert
+    rate = 100 * snap.sla_breaches / snap.sla_checked if snap.sla_checked else 0.0
+    put(win, 11, 2,
+        f"SLA >{SLA_US:g}us: {snap.sla_breaches:,} ({rate:.2f}%)", curses.A_BOLD)
+
+    flashing, on = breach_state(snap)
+    if flashing:
+        status = "!! SLA BREACH !!"
+        attr = (curses.A_REVERSE | curses.A_BOLD) if on else curses.A_BOLD
+    elif snap.breach_age is None:
+        status, attr = "SLA ok", curses.A_BOLD
+    else:
+        status, attr = f"last breach {snap.breach_age:.0f}s ago", 0
+    put(win, 12, 2, status, attr)
+    put(win, 12, 2 + len(status) + 2, f"win:{lat.over:,}")
 
     if snap.clock_errors:
         put(win, 13, 2, f"bad timestamps: {snap.clock_errors}", curses.A_REVERSE)
@@ -618,24 +673,28 @@ def draw_hist(win, snap):
 
     edges, counts = histogram(lat.ordered, min(rows, HIST_MAX_BINS))
 
-    # which percentiles fall into which bin
+    # which percentiles (and the SLA limit) fall into which bin
     tags = [[] for _ in counts]
     for name, value in lat.pct.items():
         if value is not None:
             tags[bin_of(edges, value)].append(name)
+    if edges and edges[0] <= SLA_US <= edges[-1]:
+        tags[bin_of(edges, SLA_US)].append("SLA")
 
-    put(win, 1, 2, f"n={lat.n:,}  log scale  # = count", curses.A_BOLD)
+    put(win, 1, 2, f"n={lat.n:,}  log scale  # ok  ! over {SLA_US:g}us",
+        curses.A_BOLD)
 
     prefix_w = 2 + 13 + 7   # x offset + label + count columns
-    tag_w = 11
+    tag_w = 13
     bar_w = max(0, w - prefix_w - tag_w - 1)
     biggest = max(counts) or 1
 
     for i, c in enumerate(counts):
         label = f"{edges[i]:>6.1f}-{edges[i + 1]:<6.1f}"
+        mark = "!" if edges[i] >= SLA_US else "#"  # whole bin is over the SLA
         bar = ""
         if c > 0:
-            bar = "#" * max(1, round(c / biggest * bar_w))
+            bar = mark * max(1, round(c / biggest * bar_w))
         tag_text = "/".join(tags[i])
         line = f"{label} {c:>5} {bar:<{bar_w}} {tag_text}"
         if tags[i]:
@@ -656,7 +715,8 @@ def print_histogram(lat, bins=10, width=40):
         return
     biggest = max(counts) or 1
     for i, c in enumerate(counts):
-        bar = "#" * (max(1, round(c / biggest * width)) if c else 0)
+        mark = "!" if edges[i] >= SLA_US else "#"
+        bar = mark * (max(1, round(c / biggest * width)) if c else 0)
         print(f"{edges[i]:>8.1f}-{edges[i + 1]:<8.1f} {c:>6}  {bar}")
 
 
@@ -691,9 +751,12 @@ def draw_log(win, snap, view):
     else:
         status = f"PAUSED  +{view.offset} newer  (f: resume)"
         status_attr = curses.A_REVERSE
-    put(win, 1, 2, f"{status}   fills: {snap.fill_total:,}", status_attr)
+    put(win, 1, 2,
+        f"{status}   fills: {snap.fill_total:,}   over SLA: {snap.sla_breaches:,}",
+        status_attr)
     put(win, 2, 2,
-        f"{'TIME':<13}{'ORDER':<11}{'SIDE':<6}{'QTY':>6}   {'PRICE':>9} {'LAT(us)':>9}",
+        f"{'TIME':<13}{'ORDER':<11}{'SIDE':<6}{'QTY':>6}   {'PRICE':>9} "
+        f"{'LAT(us)':>9} {'SLA':<3}",
         curses.A_BOLD)
 
     end = total - view.offset
@@ -701,10 +764,17 @@ def draw_log(win, snap, view):
     visible = snap.fills[start:end]
     for i, f in enumerate(visible):
         side = "BUY" if f.side == SIDE_BUY else "SELL"
+        breach = f.latency_ns is not None and f.latency_ns > SLA_NS
         line = (f"{fmt_time(f.ts_ns):<13}#{f.order_id:<10}{side:<6}"
-                f"{f.qty:>6} @ {f.price:>9.2f} {fmt_latency(f.latency_ns):>9}")
+                f"{f.qty:>6} @ {f.price:>9.2f} {fmt_latency(f.latency_ns):>9} "
+                f"{'!!' if breach else '':<3}")
         newest = view.follow and i == len(visible) - 1
-        put(win, 3 + i, 2, line, curses.A_BOLD if newest else 0)
+        attr = 0
+        if breach:
+            attr |= curses.A_REVERSE
+        if newest:
+            attr |= curses.A_BOLD
+        put(win, 3 + i, 2, line, attr)
 
     win.noutrefresh()
 
@@ -713,7 +783,12 @@ def draw(wins, snap, view, stats_text, bottom):
     h, w = wins["header"].getmaxyx()
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
-    put(wins["header"], 0, max(0, w - len(stats_text) - 3), stats_text)
+    stats_x = max(0, w - len(stats_text) - 3)
+    put(wins["header"], 0, stats_x, stats_text)
+    flashing, on = breach_state(snap)
+    if flashing and stats_x - 34 >= 13:  # only when there is room for it
+        put(wins["header"], 0, 34, " SLA BREACH ",
+            curses.A_REVERSE if on else curses.A_BOLD)
     wins["header"].noutrefresh()
 
     draw_book(wins["book"], snap.book)
@@ -840,6 +915,12 @@ if __name__ == "__main__":
             f"Session ended: {last.total:,} orders processed, "
             f"peak {last.peak:,.0f} orders/sec, {last.fill_total:,} fills"
         )
+        if last.sla_checked:
+            print(
+                f"SLA (> {SLA_US:g} us): {last.sla_breaches:,} breaches out of "
+                f"{last.sla_checked:,} trades "
+                f"({100 * last.sla_breaches / last.sla_checked:.2f}%)"
+            )
         if last.latency:
             lat = last.latency
             print(
@@ -852,5 +933,6 @@ if __name__ == "__main__":
                 + f"  | clock resolution {res_ns:.0f} ns, "
                 f"bad timestamps {last.clock_errors}"
             )
-            print("Latency histogram (us, log scale):")
+            print(f"Latency histogram (us, log scale, ! = over the "
+                  f"{SLA_US:g} us SLA):")
             print_histogram(lat)
