@@ -1,5 +1,6 @@
 import argparse
 import curses
+import os
 import random
 import struct
 import threading
@@ -7,27 +8,29 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import deque, namedtuple
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
 LEVELS = 5             # price levels shown per side
 TARGET_OPS = 100_000   # target throughput from the project plan
 LATENCY_BUFFER = 5000  # rolling window: how many latency samples are kept
+USE_COLOR = True       # flag: --no-color (also off if NO_COLOR is set)
 
 # SLA: a trade breaches it when its latency is strictly greater than this.
 SLA_NS = 50_000        # in nanoseconds (flag: --sla-us)
 SLA_US = SLA_NS / 1000 # the same limit in microseconds
 FLASH_S = 1.5          # how long the breach alert flashes after a breach
+SHIFT_FLASH_S = 1.5    # how long a spread shift stays highlighted
 
 WORKER_SLEEP = 0.001   # engine consumer loop pause
 TICK = 0.01            # price step between levels
 MAX_QTY = 2000
-FILL_BUFFER = 500      # how many recent fills the UI keeps
+FILL_BUFFER = 500      # how many recent events the UI keeps
 
 MIN_H, MIN_W = 28, 70  # smallest terminal the layout fits in
-WIDE_W = 120           # at this width the histogram sits next to the log
-LOG_W = 66             # width of the trade log in the wide layout
+WIDE_W = 130           # at this width the histogram sits next to the log
+LOG_W = 74             # width of the trade log in the wide layout
 PAGE = 10              # lines moved by PgUp / PgDn
 
 HIST_MAX_BINS = 20     # most rows the histogram will use
@@ -37,28 +40,36 @@ HIST_LO_FLOOR_US = 0.1 # lowest edge of the log-scale histogram
 # maths stays in whole numbers: 999 = 99.9th percentile.
 PCT_PERMILLE = (("p50", 500), ("p90", 900), ("p99", 990), ("p99.9", 999))
 
-# Binary layout of one matched fill coming from the engine.
+# Binary layout of one engine event (a fill or a cancel).
 # PLACEHOLDER: confirm the real layout with the IPC/engine members.
-#   ts_ns      wall-clock time of the trade (for display)
+#   kind       0 = fill, 1 = cancel
+#   ts_ns      wall-clock time of the event (for display)
 #   ingress_ns time.perf_counter_ns() stamped when the order entered the system
-FILL_STRUCT = struct.Struct("<QBIdQQ")
-RawFill = namedtuple("RawFill", "order_id side qty price ts_ns ingress_ns")
-# egress_ns is stamped by the UI reader when it decodes the fill.
+FILL_STRUCT = struct.Struct("<QBBIdQQ")
+RawFill = namedtuple("RawFill", "order_id side kind qty price ts_ns ingress_ns")
+# egress_ns is stamped by the UI reader when it decodes the event.
 # latency_ns = egress_ns - ingress_ns (None if the clocks disagree).
 Fill = namedtuple(
-    "Fill", "order_id side qty price ts_ns ingress_ns egress_ns latency_ns"
+    "Fill", "order_id side kind qty price ts_ns ingress_ns egress_ns latency_ns"
 )
 SIDE_BUY, SIDE_SELL = 0, 1
+KIND_FILL, KIND_CANCEL = 0, 1
 
 # n = samples in the window, pct = {"p50": value or None, ...},
 # ordered = all window samples in microseconds, sorted (feeds the histogram),
 # over = how many window samples are above the SLA
 LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered over")
+# fill_total counts every event (fills and cancels); cancel_total is the
+# cancel part of it.
 Snapshot = namedtuple(
     "Snapshot",
-    "book rate peak total fills fill_total latency polls clock_errors "
-    "sla_checked sla_breaches breach_age",
+    "book rate peak total fills fill_total cancel_total latency polls "
+    "clock_errors sla_checked sla_breaches breach_age",
 )
+
+# Display styles, filled in by init_colors(). Without color support they
+# fall back to plain attributes so the meaning is still visible.
+COLORS = {"fill": 0, "cancel": 0, "spread": 0}
 
 
 # ---------------------------------------------------------------- CLI
@@ -98,6 +109,9 @@ def build_parser():
             "  python3 ui/dashboard.py\n"
             "  python3 ui/dashboard.py --levels 8 --refresh-ms 50\n"
             "  python3 ui/dashboard.py --sla-us 30 --seed 42 --duration 30\n"
+            "  python3 ui/dashboard.py --no-color\n"
+            "\n"
+            "colors: green = fill, red = cancel, yellow = spread shift\n"
             "\n"
             "keys while running:\n"
             "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live\n"
@@ -136,6 +150,10 @@ def build_parser():
              f"flagged as a breach (default {SLA_US:g})",
     )
     parser.add_argument(
+        "--no-color", action="store_true",
+        help="turn colors off (also off when the NO_COLOR variable is set)",
+    )
+    parser.add_argument(
         "-m", "--mid-price", type=positive_float, default=150.0, metavar="PRICE",
         help="starting price of the mock market (default 150.0)",
     )
@@ -156,12 +174,14 @@ def build_parser():
 def apply_args(args):
     """Copy the launch options into the module settings the UI reads."""
     global REFRESH_MS, LEVELS, TARGET_OPS, LATENCY_BUFFER, SLA_NS, SLA_US
+    global USE_COLOR
     REFRESH_MS = args.refresh_ms
     LEVELS = args.levels
     TARGET_OPS = args.target_ops
     LATENCY_BUFFER = args.window
     SLA_NS = int(round(args.sla_us * 1000))
     SLA_US = SLA_NS / 1000
+    USE_COLOR = not args.no_color and not os.environ.get("NO_COLOR")
     if args.seed is not None:
         random.seed(args.seed)
 
@@ -173,14 +193,21 @@ class MockOrderBook:
 
     def __init__(self, mid=150.00):
         self.mid = mid
+        self.spread_ticks = 1
         self.bids = []  # list of (price, qty), best first
         self.asks = []  # list of (price, qty), best first
         self.update()
 
-    def update(self):
+    def update(self, dt=0.001):
         self.mid += random.uniform(-0.03, 0.03)
+        # the spread changes about once every 1-2 seconds, so a spread
+        # shift is a visible event and not a constant flicker
+        if random.random() < dt * 0.7:
+            self.spread_ticks = random.choice(
+                [t for t in (1, 2, 3) if t != self.spread_ticks]
+            )
         best_bid = round(self.mid, 2)
-        best_ask = round(best_bid + random.choice([1, 1, 2, 3]) * TICK, 2)
+        best_ask = round(best_bid + self.spread_ticks * TICK, 2)
         self.bids = [
             (round(best_bid - i * TICK, 2), random.randint(100, MAX_QTY))
             for i in range(LEVELS)
@@ -227,8 +254,8 @@ class MockEngineStream:
     """Stands in for the engine output until the real one exists.
 
     Replace this class with the real stream. It only needs:
-      - read() -> (orders_processed: int, fill_bytes: bytes)
-        where every fill carries the ingress perf_counter_ns() stamp
+      - read() -> (orders_processed: int, event_bytes: bytes)
+        where every event carries the ingress perf_counter_ns() stamp
       - book   -> object with .bids and .asks (lists of (price, qty))
     """
 
@@ -242,14 +269,28 @@ class MockEngineStream:
         dt = now - self.last
         self.last = now
 
-        self.book.update()
+        self.book.update(dt)
         n_orders = int(TARGET_OPS * random.uniform(0.85, 1.10) * dt)
 
         raw = b""
-        if random.random() < dt * 25:  # about 25 fills per second
+        if random.random() < dt * 25:  # about 25 events per second
             side = random.choice((SIDE_BUY, SIDE_SELL))
-            price = self.book.bids[0][0] if side == SIDE_SELL else self.book.asks[0][0]
             qty = random.randint(10, 500)
+
+            if self.next_id > 1 and random.random() < 0.15:
+                # a cancel: refers to an earlier order, at its resting price
+                kind = KIND_CANCEL
+                order_id = random.randint(max(1, self.next_id - 200),
+                                          self.next_id - 1)
+                price = (self.book.bids[0][0] if side == SIDE_BUY
+                         else self.book.asks[0][0])
+            else:
+                # a fill: trades against the opposite side of the book
+                kind = KIND_FILL
+                order_id = self.next_id
+                self.next_id += 1
+                price = (self.book.bids[0][0] if side == SIDE_SELL
+                         else self.book.asks[0][0])
 
             # Mock engine: pretend the order entered ~25 us ago by
             # backdating its ingress timestamp. Spikes: 2% are 3x slower
@@ -262,9 +303,8 @@ class MockEngineStream:
             ingress_ns = time.perf_counter_ns() - int(latency_us * 1000)
 
             raw = FILL_STRUCT.pack(
-                self.next_id, side, qty, price, time.time_ns(), ingress_ns
+                order_id, side, kind, qty, price, time.time_ns(), ingress_ns
             )
-            self.next_id += 1
 
         return n_orders, raw
 
@@ -277,15 +317,16 @@ def make_stream(args):
 
 
 class EngineReader:
-    """Reads the engine stream, decodes fills and stamps their egress time."""
+    """Reads the engine stream, decodes events and stamps their egress time."""
 
     def __init__(self, stream):
         self.stream = stream
         self.fills = deque(maxlen=FILL_BUFFER)
         self.latencies = deque(maxlen=LATENCY_BUFFER)  # nanoseconds, rolling
-        self.fill_total = 0
+        self.fill_total = 0         # all events, fills and cancels
+        self.cancel_total = 0       # of those, how many were cancels
         self.clock_errors = 0
-        self.sla_checked = 0        # fills with a valid latency
+        self.sla_checked = 0        # events with a valid latency
         self.sla_breaches = 0       # of those, how many exceeded the SLA
         self.last_breach_t = None   # perf_counter() time of the latest breach
 
@@ -316,6 +357,8 @@ class EngineReader:
 
             self.fills.append(Fill(*rf, egress_ns, latency_ns))
             self.fill_total += 1
+            if rf.kind == KIND_CANCEL:
+                self.cancel_total += 1
         return n_orders
 
 
@@ -417,6 +460,27 @@ def breach_state(snap):
     return True, int(age * 4) % 2 == 0
 
 
+class SpreadTracker:
+    """Notices when the best bid/ask spread changes between frames."""
+
+    def __init__(self):
+        self.last = None
+        self.changed_t = None
+        self.direction = 0  # +1 widened, -1 tightened
+
+    def update(self, spread, now):
+        if self.last is not None and abs(spread - self.last) > 1e-9:
+            self.direction = 1 if spread > self.last else -1
+            self.changed_t = now
+        self.last = spread
+
+    def active(self, now):
+        """+1 / -1 while a recent shift is still highlighted, else 0."""
+        if self.changed_t is None or now - self.changed_t > SHIFT_FLASH_S:
+            return 0
+        return self.direction
+
+
 class EngineWorker(threading.Thread):
     """Background thread that consumes the engine at its own pace.
 
@@ -455,6 +519,7 @@ class EngineWorker(threading.Thread):
             peak = self.meter.peak
             total = self.meter.total
             fill_total = r.fill_total
+            cancel_total = r.cancel_total
             polls = self.polls
             clock_errors = r.clock_errors
             sla_checked = r.sla_checked
@@ -467,8 +532,9 @@ class EngineWorker(threading.Thread):
 
         return Snapshot(
             book=book, rate=rate, peak=peak, total=total, fills=fills,
-            fill_total=fill_total, latency=latency_stats(samples),
-            polls=polls, clock_errors=clock_errors, sla_checked=sla_checked,
+            fill_total=fill_total, cancel_total=cancel_total,
+            latency=latency_stats(samples), polls=polls,
+            clock_errors=clock_errors, sla_checked=sla_checked,
             sla_breaches=sla_breaches, breach_age=age,
         )
 
@@ -480,8 +546,8 @@ class EngineWorker(threading.Thread):
 class LogView:
     """Scroll state of the trade log.
 
-    offset = how many fills back from the newest one the bottom row is.
-    offset 0 means 'follow': the newest trade is always visible.
+    offset = how many events back from the newest one the bottom row is.
+    offset 0 means 'follow': the newest event is always visible.
     """
 
     def __init__(self):
@@ -507,6 +573,36 @@ class LogView:
 
 
 # ------------------------------------------------------------ drawing
+
+def init_colors(enabled):
+    """Set up the color pairs. Returns True when real colors are active.
+
+    Green = fill, red = cancel, yellow = spread shift. If the terminal has
+    no color support (or colors are switched off) the styles fall back to
+    plain attributes: cancel = underline, spread shift = bold.
+    """
+    COLORS["fill"] = 0
+    COLORS["cancel"] = curses.A_UNDERLINE
+    COLORS["spread"] = curses.A_BOLD
+    if not enabled or not curses.has_colors():
+        return False
+    try:
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1  # keep the terminal's own background
+        except curses.error:
+            bg = curses.COLOR_BLACK
+        curses.init_pair(1, curses.COLOR_GREEN, bg)
+        curses.init_pair(2, curses.COLOR_RED, bg)
+        curses.init_pair(3, curses.COLOR_YELLOW, bg)
+    except curses.error:
+        return False
+    COLORS["fill"] = curses.color_pair(1)
+    COLORS["cancel"] = curses.color_pair(2)
+    COLORS["spread"] = curses.color_pair(3) | curses.A_BOLD
+    return True
+
 
 def put(win, y, x, text, attr=0):
     """addstr that never crashes or wraps if the window is too small."""
@@ -566,7 +662,7 @@ def draw_ladder_row(win, row, price, qty, bar_w, attr=0):
     put(win, row, 2, f"{price:>10.2f}{qty:>8}  {bar}", attr)
 
 
-def draw_book(win, book):
+def draw_book(win, book, spread_dir):
     draw_panel(win, "Order Book")
     h, w = win.getmaxyx()
 
@@ -582,9 +678,14 @@ def draw_book(win, book):
         price, qty = book.asks[i]
         draw_ladder_row(win, row, price, qty, bar_w, curses.A_DIM)
 
-    # spread row in the middle
+    # spread row in the middle, yellow for a moment after the spread shifts
     spread_row = 2 + levels
-    put(win, spread_row, 2, f"-- spread {book.spread:.2f} --", curses.A_BOLD)
+    if spread_dir:
+        word = "^ widened" if spread_dir > 0 else "v tightened"
+        put(win, spread_row, 2, f"-- spread {book.spread:.2f}  {word} --",
+            COLORS["spread"])
+    else:
+        put(win, spread_row, 2, f"-- spread {book.spread:.2f} --", curses.A_BOLD)
 
     # bids: best bid just below the spread row, then going down
     for i in range(levels):
@@ -738,7 +839,7 @@ def draw_log(win, snap, view):
     draw_panel(win, "Trade Log")
     h, _ = win.getmaxyx()
 
-    # row 1 = status line, row 2 = column headers, rows 3.. = trades
+    # row 1 = status line, row 2 = column headers, rows 3.. = events
     rows = max(0, h - 4)
     total = len(snap.fills)
     view.offset = min(view.offset, max(0, total - rows))
@@ -749,37 +850,56 @@ def draw_log(win, snap, view):
         status = "LIVE"
         status_attr = curses.A_BOLD
     else:
-        status = f"PAUSED  +{view.offset} newer  (f: resume)"
+        status = f"PAUSED +{view.offset} newer (f: resume)"
         status_attr = curses.A_REVERSE
+    n_fills = snap.fill_total - snap.cancel_total
     put(win, 1, 2,
-        f"{status}   fills: {snap.fill_total:,}   over SLA: {snap.sla_breaches:,}",
+        f"{status}  fills: {n_fills:,}  cancels: {snap.cancel_total:,}  "
+        f"over SLA: {snap.sla_breaches:,}",
         status_attr)
     put(win, 2, 2,
-        f"{'TIME':<13}{'ORDER':<11}{'SIDE':<6}{'QTY':>6}   {'PRICE':>9} "
-        f"{'LAT(us)':>9} {'SLA':<3}",
+        f"{'TIME':<13}{'ORDER':<10} {'EVENT':<6}{'SIDE':<5}{'QTY':>5}   "
+        f"{'PRICE':>8} {'LAT(us)':>8} {'SLA':<3}",
         curses.A_BOLD)
 
     end = total - view.offset
     start = max(0, end - rows)
     visible = snap.fills[start:end]
     for i, f in enumerate(visible):
+        cancel = f.kind == KIND_CANCEL
+        kind = "CANCEL" if cancel else "FILL"
         side = "BUY" if f.side == SIDE_BUY else "SELL"
         breach = f.latency_ns is not None and f.latency_ns > SLA_NS
-        line = (f"{fmt_time(f.ts_ns):<13}#{f.order_id:<10}{side:<6}"
-                f"{f.qty:>6} @ {f.price:>9.2f} {fmt_latency(f.latency_ns):>9} "
+        line = (f"{fmt_time(f.ts_ns):<13}#{f.order_id:<9} {kind:<6}{side:<5}"
+                f"{f.qty:>5} @ {f.price:>8.2f} {fmt_latency(f.latency_ns):>8} "
                 f"{'!!' if breach else '':<3}")
-        newest = view.follow and i == len(visible) - 1
-        attr = 0
+        attr = COLORS["cancel"] if cancel else COLORS["fill"]
         if breach:
             attr |= curses.A_REVERSE
-        if newest:
+        if view.follow and i == len(visible) - 1:
             attr |= curses.A_BOLD
         put(win, 3 + i, 2, line, attr)
 
     win.noutrefresh()
 
 
-def draw(wins, snap, view, stats_text, bottom):
+def draw_footer(win, text):
+    """Key hints on the left, a colored legend on the right if it fits."""
+    _, w = win.getmaxyx()
+    win.erase()
+    put(win, 0, 1, text)
+
+    legend = (("FILL", "fill"), ("CANCEL", "cancel"), ("SPREAD", "spread"))
+    total = sum(len(name) for name, _ in legend) + 2 * (len(legend) - 1)
+    x = w - total - 3
+    if x > len(text) + 3:
+        for name, key in legend:
+            put(win, 0, x, name, COLORS[key] | curses.A_BOLD)
+            x += len(name) + 2
+    win.noutrefresh()
+
+
+def draw(wins, snap, view, stats_text, bottom, spread_dir):
     h, w = wins["header"].getmaxyx()
     wins["header"].erase()
     put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
@@ -791,7 +911,7 @@ def draw(wins, snap, view, stats_text, bottom):
             curses.A_REVERSE if on else curses.A_BOLD)
     wins["header"].noutrefresh()
 
-    draw_book(wins["book"], snap.book)
+    draw_book(wins["book"], snap.book, spread_dir)
     draw_metrics(wins["metrics"], snap)
 
     if wins["wide"]:
@@ -805,10 +925,7 @@ def draw(wins, snap, view, stats_text, bottom):
             draw_log(wins["log"], snap, view)
         footer = "q: quit  Up/Down PgUp/PgDn: scroll log  f: follow  h: log/histogram"
 
-    wins["footer"].erase()
-    put(wins["footer"], 0, 1, footer)
-    wins["footer"].noutrefresh()
-
+    draw_footer(wins["footer"], footer)
     curses.doupdate()
 
 
@@ -835,11 +952,13 @@ def handle_resize(stdscr):
 
 def main(stdscr, args):
     curses.curs_set(0)
+    init_colors(USE_COLOR)
     stdscr.timeout(REFRESH_MS)
 
     size = stdscr.getmaxyx()
     wins = build_windows(stdscr)
     view = LogView()
+    spread = SpreadTracker()
     bottom = "log"  # which panel a narrow terminal shows: "log" or "hist"
 
     worker = EngineWorker(EngineReader(make_stream(args)))
@@ -865,12 +984,13 @@ def main(stdscr, args):
             last_polls = snap.polls
 
             view.sync(snap)
+            spread.update(snap.book.spread, now)
 
             if wins is None:
                 draw_too_small(stdscr)
             else:
                 stats_text = f"UI {fps:4.1f} fps | engine {poll_rate:,.0f} polls/s"
-                draw(wins, snap, view, stats_text, bottom)
+                draw(wins, snap, view, stats_text, bottom, spread.active(now))
 
             if args.duration is not None and now - start_t >= args.duration:
                 break
@@ -913,12 +1033,16 @@ if __name__ == "__main__":
         res_ns = time.get_clock_info("perf_counter").resolution * 1e9
         print(
             f"Session ended: {last.total:,} orders processed, "
-            f"peak {last.peak:,.0f} orders/sec, {last.fill_total:,} fills"
+            f"peak {last.peak:,.0f} orders/sec"
+        )
+        print(
+            f"Events: {last.fill_total - last.cancel_total:,} fills, "
+            f"{last.cancel_total:,} cancels"
         )
         if last.sla_checked:
             print(
                 f"SLA (> {SLA_US:g} us): {last.sla_breaches:,} breaches out of "
-                f"{last.sla_checked:,} trades "
+                f"{last.sla_checked:,} events "
                 f"({100 * last.sla_breaches / last.sla_checked:.2f}%)"
             )
         if last.latency:
