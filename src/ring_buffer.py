@@ -1,151 +1,80 @@
-import mmap
 import os
+import mmap
 import struct
-from typing import Optional, List
+import time
+from typing import List, Tuple, Optional
 
-HEADER_FORMAT = "<IIIIQ"
+# Binary Header Format:
+# Head: uint64 (8 bytes) | Tail: uint64 (8 bytes) | Capacity: uint64 (8 bytes)
+# Slot Size: uint32 (4 bytes) | Drops: uint64 (8 bytes)
+HEADER_FORMAT = "<QQQIQ"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+DEFAULT_SLOT_SIZE = 29
 
 
 class MmapRingBuffer:
-    """Zero-copy memory-mapped circular ring buffer with batching and overrun telemetry."""
+    """High-performance zero-copy shared memory circular ring buffer."""
 
-    def __init__(
-        self,
-        filepath: str,
-        slot_size: int = 29,
-        capacity: int = 1024,
-        create: bool = False,
-    ):
+    def __init__(self, filepath: str, capacity: int = 1024, slot_size: int = DEFAULT_SLOT_SIZE, create: bool = True):
         self.filepath = filepath
-        self.slot_size = slot_size
         self.capacity = capacity
+        self.slot_size = slot_size
         self.total_size = HEADER_SIZE + (self.capacity * self.slot_size)
 
         if create:
-            with open(self.filepath, "wb") as f:
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+            with open(filepath, "wb") as f:
                 f.write(b"\x00" * self.total_size)
-            self._fd = os.open(self.filepath, os.O_RDWR)
-            self._buf = mmap.mmap(self._fd, self.total_size, access=mmap.ACCESS_WRITE)
-            self._write_header(0, 0, self.capacity, self.slot_size, 0)
-        else:
-            if not os.path.exists(self.filepath):
-                raise FileNotFoundError(f"Buffer file '{self.filepath}' not found.")
-            self._fd = os.open(self.filepath, os.O_RDWR)
-            self._buf = mmap.mmap(self._fd, 0, access=mmap.ACCESS_WRITE)
-            head, tail, cap, size, drops = self._read_header()
-            self.capacity = cap
-            self.slot_size = size
-            self.total_size = HEADER_SIZE + (self.capacity * self.slot_size)
 
-    def _read_header(self) -> tuple[int, int, int, int, int]:
+        self._f = open(filepath, "r+b")
+        self._buf = mmap.mmap(self._f.fileno(), self.total_size)
+
+        if create:
+            self._write_header(0, 0, self.capacity, self.slot_size, 0)
+
+    def _read_header(self) -> Tuple[int, int, int, int, int]:
         return struct.unpack_from(HEADER_FORMAT, self._buf, 0)
 
     def _write_header(self, head: int, tail: int, capacity: int, slot_size: int, drops: int) -> None:
         struct.pack_into(HEADER_FORMAT, self._buf, 0, head, tail, capacity, slot_size, drops)
 
-    def _get_occupied_slots(self, head: int, tail: int) -> int:
-        if head >= tail:
-            return head - tail
-        return self.capacity - (tail - head)
-
-    def _get_free_slots(self, head: int, tail: int) -> int:
-        return (self.capacity - 1) - self._get_occupied_slots(head, tail)
-
-    def write(self, data: bytes) -> bool:
-        """Write single slot."""
-        if len(data) != self.slot_size:
-            raise ValueError(f"Packet size mismatch. Expected {self.slot_size}, got {len(data)}.")
-
-        head, tail, cap, size, drops = self._read_header()
-        if self._get_free_slots(head, tail) == 0:
-            # Overrun drop
-            self._write_header(head, tail, cap, size, drops + 1)
-            return False
-
-        offset = HEADER_SIZE + (head * self.slot_size)
-        self._buf[offset : offset + self.slot_size] = data
-        new_head = (head + 1) % self.capacity
-        self._write_header(new_head, tail, cap, size, drops)
-        return True
-
     def write_batch(self, packets: List[bytes]) -> int:
-        """Batch write. Returns count of successfully written packets."""
-        head, tail, cap, size, drops = self._read_header()
-        free_slots = self._get_free_slots(head, tail)
-        to_write = min(len(packets), free_slots)
+        """Writes a batch of raw fixed-size packets. Drops if capacity is exceeded."""
+        head, tail, capacity, slot_size, drops = self._read_header()
+        unconsumed = (head - tail) % capacity if head >= tail else (capacity - (tail - head))
+        available = capacity - unconsumed - 1
+
+        to_write = min(len(packets), available)
         dropped = len(packets) - to_write
 
-        current_head = head
         for i in range(to_write):
-            pkt = packets[i]
-            if len(pkt) != self.slot_size:
-                raise ValueError(f"Packet {i} invalid length {len(pkt)}. Expected {self.slot_size}.")
-            offset = HEADER_SIZE + (current_head * self.slot_size)
-            self._buf[offset : offset + self.slot_size] = pkt
-            current_head = (current_head + 1) % self.capacity
+            slot_idx = (head + i) % capacity
+            offset = HEADER_SIZE + (slot_idx * slot_size)
+            self._buf[offset : offset + slot_size] = packets[i]
 
-        self._write_header(current_head, tail, cap, size, drops + dropped)
+        new_head = (head + to_write) % capacity
+        new_drops = drops + dropped
+        self._write_header(new_head, tail, capacity, slot_size, new_drops)
         return to_write
 
-    def read(self) -> Optional[bytes]:
-        """Read single slot."""
-        head, tail, cap, size, drops = self._read_header()
+    def read_batch(self, max_count: int = 128) -> List[bytes]:
+        """Reads up to max_count raw packets from the buffer."""
+        head, tail, capacity, slot_size, drops = self._read_header()
         if head == tail:
-            return None
-
-        offset = HEADER_SIZE + (tail * self.slot_size)
-        data = bytes(self._buf[offset : offset + self.slot_size])
-        new_tail = (tail + 1) % self.capacity
-        self._write_header(head, new_tail, cap, size, drops)
-        return data
-
-    def read_batch(self, max_count: int = 100) -> List[bytes]:
-        """Batch read up to max_count items."""
-        head, tail, cap, size, drops = self._read_header()
-        occupied = self._get_occupied_slots(head, tail)
-        to_read = min(max_count, occupied)
-        if to_read == 0:
             return []
 
-        results = []
-        current_tail = tail
-        for _ in range(to_read):
-            offset = HEADER_SIZE + (current_tail * self.slot_size)
-            results.append(bytes(self._buf[offset : offset + self.slot_size]))
-            current_tail = (current_tail + 1) % self.capacity
+        unconsumed = (head - tail) % capacity if head >= tail else (capacity - (tail - head))
+        to_read = min(max_count, unconsumed)
 
-        self._write_header(head, current_tail, cap, size, drops)
-        return results
+        packets = []
+        for i in range(to_read):
+            slot_idx = (tail + i) % capacity
+            offset = HEADER_SIZE + (slot_idx * slot_size)
+            packets.append(bytes(self._buf[offset : offset + slot_size]))
 
-    def get_metrics(self) -> dict:
-        """Returns buffer state: head, tail, occupied, drops."""
-        head, tail, cap, size, drops = self._read_header()
-        return {
-            "head": head,
-            "tail": tail,
-            "capacity": cap,
-            "occupied": self._get_occupied_slots(head, tail),
-            "free": self._get_free_slots(head, tail),
-            "drops": drops,
-        }
-
-    def close(self) -> None:
-        if hasattr(self, "_buf") and self._buf:
-            self._buf.close()
-        if hasattr(self, "_fd") and self._fd:
-            os.close(self._fd)
-
-    def verify_integrity(self) -> bool:
-        """Day 6: Audits buffer pointers and capacity bounds for torn-write detection."""
-        head, tail, cap, size, drops = self._read_header()
-        if cap != self.capacity or size != self.slot_size:
-            return False
-        if head >= cap or tail >= cap:
-            return False
-        if self.total_size != HEADER_SIZE + (cap * size):
-            return False
-        return True
+        new_tail = (tail + to_read) % capacity
+        self._write_header(head, new_tail, capacity, slot_size, drops)
+        return packets
 
     def compact_ring_buffer(self, lock) -> int:
         """Day 14 Member 1: Compacts active unconsumed messages to index 0 and realigns head/tail counters."""
@@ -156,17 +85,61 @@ class MmapRingBuffer:
                 self._write_header(0, 0, capacity, slot_size, 0)
                 return 0
 
-            # Linearize and pack unconsumed items contiguous from slot 0
             compacted_data = bytearray()
             for i in range(unconsumed):
                 idx = (tail + i) % capacity
                 offset = HEADER_SIZE + (idx * slot_size)
                 compacted_data.extend(self._buf[offset : offset + slot_size])
 
-            # Write back starting at slot 0
             dest_offset = HEADER_SIZE
             self._buf[dest_offset : dest_offset + len(compacted_data)] = compacted_data
-
-            # Reset head to unconsumed count and tail to 0
             self._write_header(unconsumed, 0, capacity, slot_size, 0)
             return unconsumed
+
+    def resize_ring_buffer(self, new_capacity: int, lock) -> bool:
+        """Day 15 Member 1: Dynamically expands buffer capacity without dropping unconsumed packets."""
+        if new_capacity <= self.capacity:
+            return False
+
+        with lock:
+            head, tail, old_capacity, slot_size, drops = self._read_header()
+            unconsumed = (head - tail) % old_capacity
+
+            # Extract unconsumed items in order
+            active_items = []
+            for i in range(unconsumed):
+                idx = (tail + i) % old_capacity
+                offset = HEADER_SIZE + (idx * slot_size)
+                active_items.append(bytes(self._buf[offset : offset + slot_size]))
+
+            # On Windows, close mmap and file before resizing
+            new_total_size = HEADER_SIZE + (new_capacity * slot_size)
+            self._buf.close()
+            self._f.close()
+
+            # Resize the underlying file on disk
+            with open(self.filepath, "a+b") as f:
+                current_len = f.tell()
+                if new_total_size > current_len:
+                    f.write(b"\x00" * (new_total_size - current_len))
+
+            # Re-open file and re-map
+            self._f = open(self.filepath, "r+b")
+            self._buf = mmap.mmap(self._f.fileno(), new_total_size)
+            self.capacity = new_capacity
+            self.total_size = new_total_size
+
+            # Write active items sequentially starting from slot 0
+            for i, item in enumerate(active_items):
+                dest_offset = HEADER_SIZE + (i * slot_size)
+                self._buf[dest_offset : dest_offset + slot_size] = item
+
+            # Update header: head = unconsumed, tail = 0, new capacity
+            self._write_header(unconsumed, 0, new_capacity, slot_size, drops)
+            return True
+
+    def close(self):
+        if hasattr(self, "_buf") and not self._buf.closed:
+            self._buf.close()
+        if hasattr(self, "_f") and not self._f.closed:
+            self._f.close()

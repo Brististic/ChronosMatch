@@ -368,3 +368,36 @@ class MarketSimulator:
                 orders_b.append(pack_order(self.order_counter, b"S", px_b, int(50 * hedge_ratio), now_ns))
 
         return {sym_a: orders_a, sym_b: orders_b}
+
+
+    def generate_book_imbalance_pressure(
+        self,
+        symbol: str,
+        target_imbalance: float = 0.80,
+        batch_size: int = 20,
+    ) -> List[bytes]:
+        """Day 15 Member 3: Generates microstructural volume imbalance pressure (OBI in [-1.0, 1.0])."""
+        if symbol not in self.asset_prices:
+            self.asset_prices[symbol] = 150.0
+
+        base_px = self.asset_prices[symbol]
+        now_ns = time.perf_counter_ns()
+        orders: List[bytes] = []
+
+        # Target imbalance > 0 means heavy Bid pressure, < 0 means Ask pressure
+        bid_probability = (target_imbalance + 1.0) / 2.0
+
+        for _ in range(batch_size):
+            self.order_counter += 1
+            if random.random() < bid_probability:
+                side = b"B"
+                px = round(base_px - random.uniform(0.01, 0.15), 2)
+                qty = random.randint(50, 200)
+            else:
+                side = b"S"
+                px = round(base_px + random.uniform(0.01, 0.15), 2)
+                qty = random.randint(5, 30)
+
+            orders.append(pack_order(self.order_counter, side, px, qty, now_ns))
+
+        return orders
