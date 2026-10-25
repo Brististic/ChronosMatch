@@ -49,6 +49,7 @@ cdef struct SubmitSummary:
     uint32_t filled_quantity    # total quantity the arriving order traded
     uint32_t resting_quantity   # remainder that now rests on the book (0 if none)
     uint32_t fill_count         # number of trades this order produced
+    uint32_t levels_swept       # number of distinct price levels reached
 
 
 cdef struct FillBuffer:         # growable array of fills (Day 13: outbound ring buffer)
@@ -107,6 +108,9 @@ cdef inline int book_submit_ex(Book* b, const Order* order, FillBuffer* fills,
     cdef Fill* fill
     cdef uint32_t remaining
     cdef uint32_t traded
+    cdef uint32_t levels_swept = 0
+    cdef int64_t last_level_tick = 0
+    cdef bint have_last_level = False
     cdef uint32_t fills_before = fills.count
     cdef int64_t order_tick
     cdef Order rest
@@ -115,6 +119,7 @@ cdef inline int book_submit_ex(Book* b, const Order* order, FillBuffer* fills,
         summary.filled_quantity = 0
         summary.resting_quantity = 0
         summary.fill_count = 0
+        summary.levels_swept = 0
     if not order_is_valid(order) or not price_to_tick(b, order.price, &order_tick):
         return BOOK_ERR_INVALID                        # incl. a price that is not on the tick grid
     if idmap_find(&b.ids, order.order_id) != NULL:
@@ -125,6 +130,10 @@ cdef inline int book_submit_ex(Book* b, const Order* order, FillBuffer* fills,
         lvl = side_best(opposite)                      # price priority: best level first
         if lvl == NULL or not tick_crosses(order.side, order_tick, lvl.tick):   # exact integer compare
             break
+        if not have_last_level or lvl.tick != last_level_tick:
+            levels_swept += 1
+            last_level_tick = lvl.tick
+            have_last_level = True
         maker = lvl.head                               # time priority: oldest order first
         traded = remaining if remaining < maker.order.quantity else maker.order.quantity
         fill = fillbuf_reserve(fills)
@@ -149,6 +158,7 @@ cdef inline int book_submit_ex(Book* b, const Order* order, FillBuffer* fills,
     if summary != NULL:
         summary.filled_quantity = order.quantity - remaining
         summary.fill_count = fills.count - fills_before
+        summary.levels_swept = levels_swept
     if remaining > 0:
         rest = order[0]
         rest.quantity = remaining

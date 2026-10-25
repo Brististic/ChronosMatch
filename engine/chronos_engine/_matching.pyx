@@ -714,7 +714,9 @@ cdef class OrderBook:
         else:
             status = "PARTIAL"
         return {"status": status, "filled_quantity": summary.filled_quantity,
-                "resting_quantity": summary.resting_quantity, "fills": out}
+                "resting_quantity": summary.resting_quantity,
+                "levels_swept": summary.levels_swept,
+                "sweep_detected": summary.levels_swept >= 2, "fills": out}
 
     def remaining(self, unsigned long long order_id):
         """Quantity still resting for this order id, or None if it is not on the book."""
