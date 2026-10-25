@@ -119,3 +119,40 @@ def test_dynamic_buffer_resizing(tmp_path):
 
     rb.close()
     lock.close()
+
+
+def test_dynamic_buffer_resizing(tmp_path):
+    from src.ipc_sync import MmapProcessLock
+
+    buf_path = str(tmp_path / "resize_test.bin")
+    lock_path = str(tmp_path / "resize_test.lock")
+
+    rb = MmapRingBuffer(buf_path, capacity=8, create=True)
+    lock = MmapProcessLock(lock_path, create=True)
+
+    now = time.perf_counter_ns()
+    # Write 6 orders into capacity 8
+    rb.write_batch([pack_order(i, b"B", 100.0 + i, 10, now) for i in range(1, 7)])
+
+    # Expand buffer to capacity 32
+    success = rb.resize_ring_buffer(32, lock)
+    assert success is True
+
+    head, tail, capacity, slot_size, drops = rb._read_header()
+    assert capacity == 32
+    assert head == 6
+    assert tail == 0
+
+    # Write additional items into expanded space without drops
+    rb.write_batch([pack_order(i, b"S", 200.0, 10, now) for i in range(7, 20)])
+    head_new, _, _, _, drops_new = rb._read_header()
+    assert head_new == 19
+    assert drops_new == 0
+
+    drained = rb.read_batch(max_count=25)
+    assert len(drained) == 19
+    assert unpack_order(drained[0]).order_id == 1
+    assert unpack_order(drained[-1]).order_id == 19
+
+    rb.close()
+    lock.close()

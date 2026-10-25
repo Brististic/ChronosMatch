@@ -169,3 +169,20 @@ def test_order_book_imbalance_pressure():
     # Imbalance skew: Bid volume must heavily dominate Ask volume
     assert len(bids) > len(asks)
     assert total_bid_qty > total_ask_qty
+
+
+def test_order_book_imbalance_pressure():
+    sim = MarketSimulator(symbols=["AAPL"])
+    orders = sim.generate_book_imbalance_pressure("AAPL", target_imbalance=0.85, batch_size=50)
+
+    assert len(orders) == 50
+    unpacked = [unpack_order(p) for p in orders]
+    bids = [o for o in unpacked if o.side == b"B"]
+    asks = [o for o in unpacked if o.side == b"S"]
+
+    total_bid_qty = sum(o.quantity for o in bids)
+    total_ask_qty = sum(o.quantity for o in asks)
+
+    # Imbalance assertion: Bid count and volume must dominate Ask
+    assert len(bids) > len(asks)
+    assert total_bid_qty > total_ask_qty

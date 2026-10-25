@@ -143,3 +143,47 @@ class MmapRingBuffer:
             self._buf.close()
         if hasattr(self, "_f") and not self._f.closed:
             self._f.close()
+
+
+    def resize_ring_buffer(self, new_capacity: int, lock) -> bool:
+        """Day 15 Member 1: Dynamically expands buffer capacity without dropping unconsumed packets."""
+        if new_capacity <= self.capacity:
+            return False
+
+        with lock:
+            head, tail, old_capacity, slot_size, drops = self._read_header()
+            unconsumed = (head - tail) % old_capacity
+
+            # Extract unconsumed items in chronological order
+            active_items = []
+            for i in range(unconsumed):
+                idx = (tail + i) % old_capacity
+                offset = HEADER_SIZE + (idx * slot_size)
+                active_items.append(bytes(self._buf[offset : offset + slot_size]))
+
+            new_total_size = HEADER_SIZE + (new_capacity * slot_size)
+
+            # Safely release Windows mmap and file handle before expanding
+            self._buf.close()
+            self._f.close()
+
+            # Extend file on disk
+            with open(self.filepath, "a+b") as f:
+                current_len = f.tell()
+                if new_total_size > current_len:
+                    f.write(b"\x00" * (new_total_size - current_len))
+
+            # Reopen and remap
+            self._f = open(self.filepath, "r+b")
+            self._buf = mmap.mmap(self._f.fileno(), new_total_size)
+            self.capacity = new_capacity
+            self.total_size = new_total_size
+
+            # Repack unconsumed items starting at slot 0
+            for i, item in enumerate(active_items):
+                dest_offset = HEADER_SIZE + (i * slot_size)
+                self._buf[dest_offset : dest_offset + slot_size] = item
+
+            # Update header: head = unconsumed count, tail = 0, new capacity
+            self._write_header(unconsumed, 0, new_capacity, slot_size, drops)
+            return True
