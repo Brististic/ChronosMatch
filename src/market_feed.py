@@ -218,3 +218,34 @@ class MarketSimulator:
         self.asset_prices[symbol] = new_price
 
         return toxic_orders, new_price
+
+
+    def generate_spoofing_attack(
+        self,
+        symbol: str,
+        fake_layers: int = 5,
+        fake_qty_per_layer: int = 1000,
+    ) -> Tuple[List[bytes], bytes, List[bytes]]:
+        if symbol not in self.asset_prices:
+            self.asset_prices[symbol] = 150.0
+
+        base_px = self.asset_prices[symbol]
+        now_ns = time.perf_counter_ns()
+
+        fake_bids: List[bytes] = []
+        fake_order_ids: List[int] = []
+
+        for i in range(1, fake_layers + 1):
+            self.order_counter += 1
+            fake_px = round(base_px - (i * 0.02), 2)
+            fake_bids.append(pack_order(self.order_counter, b"B", fake_px, fake_qty_per_layer, now_ns))
+            fake_order_ids.append(self.order_counter)
+
+        self.order_counter += 1
+        real_sell = pack_order(self.order_counter, b"S", base_px, 150, now_ns + 500)
+
+        cancellations: List[bytes] = []
+        for oid in fake_order_ids:
+            cancellations.append(pack_order(oid, b"B", 0.0, 0, now_ns + 1500))
+
+        return fake_bids, real_sell, cancellations

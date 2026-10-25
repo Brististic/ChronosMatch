@@ -116,3 +116,25 @@ def test_toxic_flow_simulation():
     unpacked = [unpack_order(p) for p in toxic_orders]
     assert all(o.side == b"B" for o in unpacked)
     assert unpacked[-1].price >= unpacked[0].price
+
+
+def test_spoofing_attack_generation():
+    sim = MarketSimulator(symbols=["AAPL"])
+    fake_bids, real_sell, cancels = sim.generate_spoofing_attack("AAPL", fake_layers=4, fake_qty_per_layer=500)
+
+    assert len(fake_bids) == 4
+    assert len(cancels) == 4
+
+    unpacked_bids = [unpack_order(b) for b in fake_bids]
+    assert all(b.side == b"B" for b in unpacked_bids)
+    assert all(b.quantity == 500 for b in unpacked_bids)
+
+    unpacked_sell = unpack_order(real_sell)
+    assert unpacked_sell.side == b"S"
+    assert unpacked_sell.quantity == 150
+
+    unpacked_cancels = [unpack_order(c) for c in cancels]
+    assert all(c.quantity == 0 for c in unpacked_cancels)
+    fake_ids = [b.order_id for b in unpacked_bids]
+    cancel_ids = [c.order_id for c in unpacked_cancels]
+    assert fake_ids == cancel_ids
