@@ -8,7 +8,7 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import deque, namedtuple
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
@@ -16,12 +16,14 @@ LEVELS = 5             # price levels shown per side
 TARGET_OPS = 100_000   # target throughput from the project plan
 LATENCY_BUFFER = 5000  # rolling window: how many latency samples are kept
 USE_COLOR = True       # flag: --no-color (also off if NO_COLOR is set)
+WHALE_EVERY_S = 12.0   # mock only: average seconds between whale sweeps
 
 # SLA: a trade breaches it when its latency is strictly greater than this.
 SLA_NS = 50_000        # in nanoseconds (flag: --sla-us)
 SLA_US = SLA_NS / 1000 # the same limit in microseconds
 FLASH_S = 1.5          # how long the breach alert flashes after a breach
 SHIFT_FLASH_S = 1.5    # how long a spread shift stays highlighted
+WHALE_FLASH_S = 3.0    # how long a whale sweep alert flashes
 
 WORKER_SLEEP = 0.001   # engine consumer loop pause
 TICK = 0.01            # price step between levels
@@ -40,36 +42,41 @@ HIST_LO_FLOOR_US = 0.1 # lowest edge of the log-scale histogram
 # maths stays in whole numbers: 999 = 99.9th percentile.
 PCT_PERMILLE = (("p50", 500), ("p90", 900), ("p99", 990), ("p99.9", 999))
 
-# Binary layout of one engine event (a fill or a cancel).
+# Binary layout of one engine event (a fill, a cancel or a whale sweep).
 # PLACEHOLDER: confirm the real layout with the IPC/engine members.
-#   kind       0 = fill, 1 = cancel
+#   kind       0 = fill, 1 = cancel, 2 = whale sweep
+#   levels     how many price levels the order swept (whale sweeps)
 #   ts_ns      wall-clock time of the event (for display)
 #   ingress_ns time.perf_counter_ns() stamped when the order entered the system
-FILL_STRUCT = struct.Struct("<QBBIdQQ")
-RawFill = namedtuple("RawFill", "order_id side kind qty price ts_ns ingress_ns")
+FILL_STRUCT = struct.Struct("<QBBBIdQQ")
+RawFill = namedtuple(
+    "RawFill", "order_id side kind levels qty price ts_ns ingress_ns"
+)
 # egress_ns is stamped by the UI reader when it decodes the event.
 # latency_ns = egress_ns - ingress_ns (None if the clocks disagree).
 Fill = namedtuple(
-    "Fill", "order_id side kind qty price ts_ns ingress_ns egress_ns latency_ns"
+    "Fill",
+    "order_id side kind levels qty price ts_ns ingress_ns egress_ns latency_ns",
 )
 SIDE_BUY, SIDE_SELL = 0, 1
-KIND_FILL, KIND_CANCEL = 0, 1
+KIND_FILL, KIND_CANCEL, KIND_WHALE = 0, 1, 2
 
 # n = samples in the window, pct = {"p50": value or None, ...},
 # ordered = all window samples in microseconds, sorted (feeds the histogram),
 # over = how many window samples are above the SLA
 LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered over")
-# fill_total counts every event (fills and cancels); cancel_total is the
-# cancel part of it.
+# fill_total counts every event (fills, cancels and whales); cancel_total and
+# whale_total are parts of it. whale = (side, levels, qty, price) of the most
+# recent whale sweep, whale_age = seconds since it happened.
 Snapshot = namedtuple(
     "Snapshot",
-    "book rate peak total fills fill_total cancel_total latency polls "
-    "clock_errors sla_checked sla_breaches breach_age",
+    "book rate peak total fills fill_total cancel_total whale_total whale "
+    "whale_age latency polls clock_errors sla_checked sla_breaches breach_age",
 )
 
 # Display styles, filled in by init_colors(). Without color support they
 # fall back to plain attributes so the meaning is still visible.
-COLORS = {"fill": 0, "cancel": 0, "spread": 0}
+COLORS = {"fill": 0, "cancel": 0, "spread": 0, "whale": 0}
 
 
 # ---------------------------------------------------------------- CLI
@@ -109,14 +116,17 @@ def build_parser():
             "  python3 ui/dashboard.py\n"
             "  python3 ui/dashboard.py --levels 8 --refresh-ms 50\n"
             "  python3 ui/dashboard.py --sla-us 30 --seed 42 --duration 30\n"
+            "  python3 ui/dashboard.py --whale-every 5\n"
             "  python3 ui/dashboard.py --no-color\n"
             "\n"
-            "colors: green = fill, red = cancel, yellow = spread shift\n"
+            "colors: green = fill, red = cancel, yellow = spread shift, "
+            "magenta = whale sweep\n"
             "\n"
             "keys while running:\n"
             "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live\n"
             "  h switch the bottom panel between log and histogram (narrow "
-            "terminals)"
+            "terminals)\n"
+            "  w trigger a test whale sweep (mock source only)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -150,6 +160,12 @@ def build_parser():
              f"flagged as a breach (default {SLA_US:g})",
     )
     parser.add_argument(
+        "--whale-every", type=positive_float, default=WHALE_EVERY_S,
+        metavar="SECONDS",
+        help="mock source: average seconds between whale sweeps "
+             f"(default {WHALE_EVERY_S:g})",
+    )
+    parser.add_argument(
         "--no-color", action="store_true",
         help="turn colors off (also off when the NO_COLOR variable is set)",
     )
@@ -174,13 +190,14 @@ def build_parser():
 def apply_args(args):
     """Copy the launch options into the module settings the UI reads."""
     global REFRESH_MS, LEVELS, TARGET_OPS, LATENCY_BUFFER, SLA_NS, SLA_US
-    global USE_COLOR
+    global USE_COLOR, WHALE_EVERY_S
     REFRESH_MS = args.refresh_ms
     LEVELS = args.levels
     TARGET_OPS = args.target_ops
     LATENCY_BUFFER = args.window
     SLA_NS = int(round(args.sla_us * 1000))
     SLA_US = SLA_NS / 1000
+    WHALE_EVERY_S = args.whale_every
     USE_COLOR = not args.no_color and not os.environ.get("NO_COLOR")
     if args.seed is not None:
         random.seed(args.seed)
@@ -263,6 +280,39 @@ class MockEngineStream:
         self.book = MockOrderBook(mid)
         self.last = time.perf_counter()
         self.next_id = 1
+        self.whale_requested = False
+        self.next_whale_t = self.last + WHALE_EVERY_S * 0.5
+
+    def request_whale(self):
+        """Ask for a test whale sweep (the 'w' key). Mock source only."""
+        self.whale_requested = True
+
+    @staticmethod
+    def _ingress_ns():
+        """Backdate an ingress stamp by a mock engine latency (~25 us).
+        Spikes: 2% are 3x slower (about 75 us, an SLA breach), about 0.2%
+        are 10x slower."""
+        latency_us = max(1.0, random.gauss(25, 4))
+        if random.random() < 0.02:
+            latency_us *= 3
+        if random.random() < 0.002:
+            latency_us *= 10
+        return time.perf_counter_ns() - int(latency_us * 1000)
+
+    def _whale_record(self):
+        """One big order that clears several price levels of the book."""
+        side = random.choice((SIDE_BUY, SIDE_SELL))
+        levels = random.randint(min(3, LEVELS), min(6, LEVELS))
+        # a buy sweeps the asks, a sell sweeps the bids
+        book_side = self.book.asks if side == SIDE_BUY else self.book.bids
+        qty = sum(q for _, q in book_side[:levels])  # all liquidity cleared
+        price = book_side[levels - 1][0]             # deepest level reached
+        order_id = self.next_id
+        self.next_id += 1
+        return FILL_STRUCT.pack(
+            order_id, side, KIND_WHALE, levels, qty, price,
+            time.time_ns(), self._ingress_ns(),
+        )
 
     def read(self):
         now = time.perf_counter()
@@ -292,19 +342,15 @@ class MockEngineStream:
                 price = (self.book.bids[0][0] if side == SIDE_SELL
                          else self.book.asks[0][0])
 
-            # Mock engine: pretend the order entered ~25 us ago by
-            # backdating its ingress timestamp. Spikes: 2% are 3x slower
-            # (about 75 us, an SLA breach), about 0.2% are 10x slower.
-            latency_us = max(1.0, random.gauss(25, 4))
-            if random.random() < 0.02:
-                latency_us *= 3
-            if random.random() < 0.002:
-                latency_us *= 10
-            ingress_ns = time.perf_counter_ns() - int(latency_us * 1000)
-
-            raw = FILL_STRUCT.pack(
-                order_id, side, kind, qty, price, time.time_ns(), ingress_ns
+            raw += FILL_STRUCT.pack(
+                order_id, side, kind, 0, qty, price,
+                time.time_ns(), self._ingress_ns(),
             )
+
+        if self.whale_requested or now >= self.next_whale_t:
+            self.whale_requested = False
+            self.next_whale_t = now + WHALE_EVERY_S * random.uniform(0.6, 1.4)
+            raw += self._whale_record()
 
         return n_orders, raw
 
@@ -323,8 +369,11 @@ class EngineReader:
         self.stream = stream
         self.fills = deque(maxlen=FILL_BUFFER)
         self.latencies = deque(maxlen=LATENCY_BUFFER)  # nanoseconds, rolling
-        self.fill_total = 0         # all events, fills and cancels
+        self.fill_total = 0         # all events: fills, cancels and whales
         self.cancel_total = 0       # of those, how many were cancels
+        self.whale_total = 0        # of those, how many were whale sweeps
+        self.last_whale = None      # (side, levels, qty, price)
+        self.last_whale_t = None    # perf_counter() time of the latest whale
         self.clock_errors = 0
         self.sla_checked = 0        # events with a valid latency
         self.sla_breaches = 0       # of those, how many exceeded the SLA
@@ -359,6 +408,10 @@ class EngineReader:
             self.fill_total += 1
             if rf.kind == KIND_CANCEL:
                 self.cancel_total += 1
+            elif rf.kind == KIND_WHALE:
+                self.whale_total += 1
+                self.last_whale = (rf.side, rf.levels, rf.qty, rf.price)
+                self.last_whale_t = time.perf_counter()
         return n_orders
 
 
@@ -460,6 +513,17 @@ def breach_state(snap):
     return True, int(age * 4) % 2 == 0
 
 
+def whale_state(snap):
+    """While a whale alert is active: ((side, levels, qty, price), on, age),
+    where 'on' is the lit half of the flash (five flashes a second).
+    Otherwise None."""
+    if snap.whale is None or snap.whale_age is None:
+        return None
+    if snap.whale_age > WHALE_FLASH_S:
+        return None
+    return snap.whale, int(snap.whale_age * 5) % 2 == 0, snap.whale_age
+
+
 class SpreadTracker:
     """Notices when the best bid/ask spread changes between frames."""
 
@@ -520,22 +584,26 @@ class EngineWorker(threading.Thread):
             total = self.meter.total
             fill_total = r.fill_total
             cancel_total = r.cancel_total
+            whale_total = r.whale_total
+            whale = r.last_whale
+            last_whale_t = r.last_whale_t
             polls = self.polls
             clock_errors = r.clock_errors
             sla_checked = r.sla_checked
             sla_breaches = r.sla_breaches
             last_breach_t = r.last_breach_t
 
-        age = None
-        if last_breach_t is not None:
-            age = time.perf_counter() - last_breach_t
+        now = time.perf_counter()
+        breach_age = None if last_breach_t is None else now - last_breach_t
+        whale_age = None if last_whale_t is None else now - last_whale_t
 
         return Snapshot(
             book=book, rate=rate, peak=peak, total=total, fills=fills,
             fill_total=fill_total, cancel_total=cancel_total,
+            whale_total=whale_total, whale=whale, whale_age=whale_age,
             latency=latency_stats(samples), polls=polls,
             clock_errors=clock_errors, sla_checked=sla_checked,
-            sla_breaches=sla_breaches, breach_age=age,
+            sla_breaches=sla_breaches, breach_age=breach_age,
         )
 
     def stop(self):
@@ -577,13 +645,15 @@ class LogView:
 def init_colors(enabled):
     """Set up the color pairs. Returns True when real colors are active.
 
-    Green = fill, red = cancel, yellow = spread shift. If the terminal has
-    no color support (or colors are switched off) the styles fall back to
-    plain attributes: cancel = underline, spread shift = bold.
+    Green = fill, red = cancel, yellow = spread shift, magenta = whale.
+    If the terminal has no color support (or colors are switched off) the
+    styles fall back to plain attributes: cancel = underline, spread shift
+    and whale = bold. The whale alert still flashes using reverse video.
     """
     COLORS["fill"] = 0
     COLORS["cancel"] = curses.A_UNDERLINE
     COLORS["spread"] = curses.A_BOLD
+    COLORS["whale"] = curses.A_BOLD
     if not enabled or not curses.has_colors():
         return False
     try:
@@ -596,11 +666,13 @@ def init_colors(enabled):
         curses.init_pair(1, curses.COLOR_GREEN, bg)
         curses.init_pair(2, curses.COLOR_RED, bg)
         curses.init_pair(3, curses.COLOR_YELLOW, bg)
+        curses.init_pair(4, curses.COLOR_MAGENTA, bg)
     except curses.error:
         return False
     COLORS["fill"] = curses.color_pair(1)
     COLORS["cancel"] = curses.color_pair(2)
     COLORS["spread"] = curses.color_pair(3) | curses.A_BOLD
+    COLORS["whale"] = curses.color_pair(4) | curses.A_BOLD
     return True
 
 
@@ -662,7 +734,33 @@ def draw_ladder_row(win, row, price, qty, bar_w, attr=0):
     put(win, row, 2, f"{price:>10.2f}{qty:>8}  {bar}", attr)
 
 
-def draw_book(win, book, spread_dir):
+def draw_header(win, snap, stats_text, ws):
+    """Title and stats, or a full-width flashing banner during a whale sweep."""
+    _, w = win.getmaxyx()
+    win.erase()
+
+    if ws:
+        (side, levels, qty, price), on, _age = ws
+        word = "BUY" if side == SIDE_BUY else "SELL"
+        text = (f">>> WHALE SWEEP {word} {qty:,} | {levels} levels "
+                f"| to {price:.2f} <<<")
+        attr = COLORS["whale"] | curses.A_BOLD
+        if on:
+            attr |= curses.A_REVERSE
+        put(win, 0, 0, text.center(w - 1), attr)
+    else:
+        put(win, 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
+        stats_x = max(0, w - len(stats_text) - 3)
+        put(win, 0, stats_x, stats_text)
+        flashing, on = breach_state(snap)
+        if flashing and stats_x - 34 >= 13:  # only when there is room for it
+            put(win, 0, 34, " SLA BREACH ",
+                curses.A_REVERSE if on else curses.A_BOLD)
+
+    win.noutrefresh()
+
+
+def draw_book(win, book, spread_dir, ws):
     draw_panel(win, "Order Book")
     h, w = win.getmaxyx()
 
@@ -670,13 +768,25 @@ def draw_book(win, book, spread_dir):
     levels = max(0, min(LEVELS, (h - 4) // 2))
     bar_w = max(0, w - 24)
 
+    # a whale sweep flashes the price levels it just cleared
+    sweep_side, sweep_n, sweep_attr = None, 0, 0
+    if ws:
+        (sweep_side, sweep_n, _qty, _price), on, _age = ws
+        sweep_attr = COLORS["whale"] | curses.A_BOLD
+        if on:
+            sweep_attr |= curses.A_REVERSE
+
     put(win, 1, 2, f"{'PRICE':>10}{'QTY':>8}  DEPTH", curses.A_BOLD)
 
-    # asks: furthest level on top, best ask just above the spread row
+    # asks: furthest level on top, best ask just above the spread row.
+    # A buy sweep clears the asks.
     for i in range(levels):
         row = 2 + (levels - 1 - i)
         price, qty = book.asks[i]
-        draw_ladder_row(win, row, price, qty, bar_w, curses.A_DIM)
+        if sweep_side == SIDE_BUY and i < sweep_n:
+            put(win, row, 2, f"{price:>10.2f}{0:>8}  << SWEPT", sweep_attr)
+        else:
+            draw_ladder_row(win, row, price, qty, bar_w, curses.A_DIM)
 
     # spread row in the middle, yellow for a moment after the spread shifts
     spread_row = 2 + levels
@@ -687,11 +797,15 @@ def draw_book(win, book, spread_dir):
     else:
         put(win, spread_row, 2, f"-- spread {book.spread:.2f} --", curses.A_BOLD)
 
-    # bids: best bid just below the spread row, then going down
+    # bids: best bid just below the spread row, then going down.
+    # A sell sweep clears the bids.
     for i in range(levels):
         row = spread_row + 1 + i
         price, qty = book.bids[i]
-        draw_ladder_row(win, row, price, qty, bar_w)
+        if sweep_side == SIDE_SELL and i < sweep_n:
+            put(win, row, 2, f"{price:>10.2f}{0:>8}  << SWEPT", sweep_attr)
+        else:
+            draw_ladder_row(win, row, price, qty, bar_w)
 
     win.noutrefresh()
 
@@ -850,30 +964,37 @@ def draw_log(win, snap, view):
         status = "LIVE"
         status_attr = curses.A_BOLD
     else:
-        status = f"PAUSED +{view.offset} newer (f: resume)"
+        status = f"PAUSED +{view.offset} (f: resume)"
         status_attr = curses.A_REVERSE
     n_fills = snap.fill_total - snap.cancel_total
     put(win, 1, 2,
         f"{status}  fills: {n_fills:,}  cancels: {snap.cancel_total:,}  "
-        f"over SLA: {snap.sla_breaches:,}",
+        f"whales: {snap.whale_total:,}  over SLA: {snap.sla_breaches:,}",
         status_attr)
     put(win, 2, 2,
         f"{'TIME':<13}{'ORDER':<10} {'EVENT':<6}{'SIDE':<5}{'QTY':>5}   "
         f"{'PRICE':>8} {'LAT(us)':>8} {'SLA':<3}",
         curses.A_BOLD)
 
+    now_ns = time.perf_counter_ns()
     end = total - view.offset
     start = max(0, end - rows)
     visible = snap.fills[start:end]
     for i, f in enumerate(visible):
         cancel = f.kind == KIND_CANCEL
-        kind = "CANCEL" if cancel else "FILL"
+        whale = f.kind == KIND_WHALE
+        kind = "WHALE" if whale else ("CANCEL" if cancel else "FILL")
         side = "BUY" if f.side == SIDE_BUY else "SELL"
         breach = f.latency_ns is not None and f.latency_ns > SLA_NS
         line = (f"{fmt_time(f.ts_ns):<13}#{f.order_id:<9} {kind:<6}{side:<5}"
                 f"{f.qty:>5} @ {f.price:>8.2f} {fmt_latency(f.latency_ns):>8} "
                 f"{'!!' if breach else '':<3}")
         attr = COLORS["cancel"] if cancel else COLORS["fill"]
+        if whale:
+            attr = COLORS["whale"] | curses.A_BOLD
+            age = (now_ns - f.egress_ns) / 1e9
+            if age <= WHALE_FLASH_S and int(age * 5) % 2 == 0:
+                attr |= curses.A_REVERSE  # flashing while the whale is recent
         if breach:
             attr |= curses.A_REVERSE
         if view.follow and i == len(visible) - 1:
@@ -889,7 +1010,8 @@ def draw_footer(win, text):
     win.erase()
     put(win, 0, 1, text)
 
-    legend = (("FILL", "fill"), ("CANCEL", "cancel"), ("SPREAD", "spread"))
+    legend = (("FILL", "fill"), ("CANCEL", "cancel"),
+              ("SPREAD", "spread"), ("WHALE", "whale"))
     total = sum(len(name) for name, _ in legend) + 2 * (len(legend) - 1)
     x = w - total - 3
     if x > len(text) + 3:
@@ -900,30 +1022,22 @@ def draw_footer(win, text):
 
 
 def draw(wins, snap, view, stats_text, bottom, spread_dir):
-    h, w = wins["header"].getmaxyx()
-    wins["header"].erase()
-    put(wins["header"], 0, 1, "ChronosMatch :: Latency Monitor", curses.A_BOLD)
-    stats_x = max(0, w - len(stats_text) - 3)
-    put(wins["header"], 0, stats_x, stats_text)
-    flashing, on = breach_state(snap)
-    if flashing and stats_x - 34 >= 13:  # only when there is room for it
-        put(wins["header"], 0, 34, " SLA BREACH ",
-            curses.A_REVERSE if on else curses.A_BOLD)
-    wins["header"].noutrefresh()
+    ws = whale_state(snap)
 
-    draw_book(wins["book"], snap.book, spread_dir)
+    draw_header(wins["header"], snap, stats_text, ws)
+    draw_book(wins["book"], snap.book, spread_dir, ws)
     draw_metrics(wins["metrics"], snap)
 
     if wins["wide"]:
         draw_log(wins["log"], snap, view)
         draw_hist(wins["hist"], snap)
-        footer = "q: quit   Up/Down PgUp/PgDn: scroll log   f/End: follow"
+        footer = "q quit  Up/Dn PgUp/PgDn scroll log  f/End follow  w test whale"
     else:
         if bottom == "hist":
             draw_hist(wins["hist"], snap)
         else:
             draw_log(wins["log"], snap, view)
-        footer = "q: quit  Up/Down PgUp/PgDn: scroll log  f: follow  h: log/histogram"
+        footer = "q quit  Up/Dn PgUp/PgDn scroll  f follow  h log/hist  w whale"
 
     draw_footer(wins["footer"], footer)
     curses.doupdate()
@@ -1010,6 +1124,10 @@ def main(stdscr, args):
                 view.resume()
             elif key in (ord("h"), ord("H")):
                 bottom = "hist" if bottom == "log" else "log"
+            elif key in (ord("w"), ord("W")):
+                stream = worker.reader.stream
+                if hasattr(stream, "request_whale"):  # mock source only
+                    stream.request_whale()
             # KEY_RESIZE is the normal signal, the size check is a safety net
             if key == curses.KEY_RESIZE or stdscr.getmaxyx() != size:
                 wins, size = handle_resize(stdscr)
@@ -1036,7 +1154,8 @@ if __name__ == "__main__":
             f"peak {last.peak:,.0f} orders/sec"
         )
         print(
-            f"Events: {last.fill_total - last.cancel_total:,} fills, "
+            f"Events: {last.fill_total - last.cancel_total:,} fills "
+            f"(including {last.whale_total:,} whale sweeps), "
             f"{last.cancel_total:,} cancels"
         )
         if last.sla_checked:
