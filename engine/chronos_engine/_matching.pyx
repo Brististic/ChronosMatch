@@ -1034,16 +1034,32 @@ def _pid_alive(int pid):
         return True
     if sys.platform == "win32":
         import ctypes
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
-        if handle == 0:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong
+        ]
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            if not ok:
+                return True
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
     except PermissionError:
-        return True                  # exists, but belongs to another user
+        return True
     except OSError:
         return False
 
