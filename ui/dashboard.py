@@ -3,12 +3,14 @@ import curses
 import os
 import random
 import struct
+import subprocess
+import sys
 import threading
 import time
 from bisect import bisect_left, bisect_right
 from collections import deque, namedtuple
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
@@ -25,13 +27,19 @@ FLASH_S = 1.5          # how long the breach alert flashes after a breach
 SHIFT_FLASH_S = 1.5    # how long a spread shift stays highlighted
 WHALE_FLASH_S = 3.0    # how long a whale sweep alert flashes
 
+TELEMETRY_S = 1.0      # how often CPU and memory are sampled
+RING_SLOTS = 65_536    # mock shared-memory ring capacity, in event slots
+RING_WARN = 0.80       # high watermark: alert when the ring is this full
+RING_FLASH_S = 2.0     # how long the watermark alert stays lit
+
 WORKER_SLEEP = 0.001   # engine consumer loop pause
 TICK = 0.01            # price step between levels
 MAX_QTY = 2000
 FILL_BUFFER = 500      # how many recent events the UI keeps
 
 MIN_H, MIN_W = 28, 70  # smallest terminal the layout fits in
-WIDE_W = 130           # at this width the histogram sits next to the log
+WIDE_W = 130           # at this width everything is visible at once
+TOP_COL_W = 46         # width of the order book and metrics panels (wide)
 LOG_W = 74             # width of the trade log in the wide layout
 PAGE = 10              # lines moved by PgUp / PgDn
 
@@ -68,11 +76,16 @@ LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered over")
 # fill_total counts every event (fills, cancels and whales); cancel_total and
 # whale_total are parts of it. whale = (side, levels, qty, price) of the most
 # recent whale sweep, whale_age = seconds since it happened.
+# ring = None, or (capacity, used, peak_used, watermark_alerts, alert_age)
+# describing the shared-memory ring buffer.
 Snapshot = namedtuple(
     "Snapshot",
     "book rate peak total fills fill_total cancel_total whale_total whale "
-    "whale_age latency polls clock_errors sla_checked sla_breaches breach_age",
+    "whale_age latency polls clock_errors sla_checked sla_breaches breach_age "
+    "ring",
 )
+# Resource use of this dashboard process (cpu = % of one core).
+Health = namedtuple("Health", "cpu load cores rss_mb peak_mb threads uptime")
 
 # Display styles, filled in by init_colors(). Without color support they
 # fall back to plain attributes so the meaning is still visible.
@@ -124,8 +137,9 @@ def build_parser():
             "\n"
             "keys while running:\n"
             "  q quit | Up/Down scroll log | PgUp/PgDn page | f or End follow live\n"
-            "  h switch the bottom panel between log and histogram (narrow "
-            "terminals)\n"
+            "  h cycle the bottom panel: log, histogram, system health "
+            "(narrow terminals;\n"
+            "    wide terminals show all of them at once)\n"
             "  w trigger a test whale sweep (mock source only)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -270,10 +284,12 @@ class BookSnapshot:
 class MockEngineStream:
     """Stands in for the engine output until the real one exists.
 
-    Replace this class with the real stream. It only needs:
+    Replace this class with the real stream. It needs:
       - read() -> (orders_processed: int, event_bytes: bytes)
         where every event carries the ingress perf_counter_ns() stamp
       - book   -> object with .bids and .asks (lists of (price, qty))
+      - ring_stats() -> (capacity, used, peak_used) of the shared-memory
+        ring buffer (optional: the health panel shows 'no data' without it)
     """
 
     def __init__(self, mid=150.00):
@@ -282,10 +298,17 @@ class MockEngineStream:
         self.next_id = 1
         self.whale_requested = False
         self.next_whale_t = self.last + WHALE_EVERY_S * 0.5
+        self.ring_floor = int(0.09 * RING_SLOTS)  # resting backlog
+        self.ring_used = self.ring_floor
+        self.ring_peak = self.ring_used
 
     def request_whale(self):
         """Ask for a test whale sweep (the 'w' key). Mock source only."""
         self.whale_requested = True
+
+    def ring_stats(self):
+        """(capacity, used, peak_used) of the mock shared-memory ring."""
+        return RING_SLOTS, self.ring_used, self.ring_peak
 
     @staticmethod
     def _ingress_ns():
@@ -351,6 +374,20 @@ class MockEngineStream:
             self.whale_requested = False
             self.next_whale_t = now + WHALE_EVERY_S * random.uniform(0.6, 1.4)
             raw += self._whale_record()
+            # a whale is a burst: the ring buffer suddenly fills up
+            self.ring_used = max(self.ring_used,
+                                 int(RING_SLOTS * random.uniform(0.90, 0.98)))
+
+        # the consumer drains the backlog back toward a small resting level
+        self.ring_floor = int(min(max(
+            self.ring_floor + random.uniform(-0.0015, 0.0015) * RING_SLOTS,
+            0.06 * RING_SLOTS), 0.12 * RING_SLOTS))
+        if self.ring_used > self.ring_floor:
+            drain = (self.ring_used - self.ring_floor) * min(1.0, dt * 0.25)
+            self.ring_used -= int(drain)
+        else:
+            self.ring_used = self.ring_floor
+        self.ring_peak = max(self.ring_peak, self.ring_used)
 
         return n_orders, raw
 
@@ -378,14 +415,30 @@ class EngineReader:
         self.sla_checked = 0        # events with a valid latency
         self.sla_breaches = 0       # of those, how many exceeded the SLA
         self.last_breach_t = None   # perf_counter() time of the latest breach
+        self.ring_warns = 0         # times the ring crossed the high watermark
+        self.ring_hot = False       # is the ring above the watermark right now
+        self.ring_warn_t = None     # perf_counter() time it was last above it
 
     @property
     def book(self):
         return self.stream.book
 
+    def _check_ring(self):
+        """Count a watermark alert each time the ring fills past RING_WARN."""
+        if not hasattr(self.stream, "ring_stats"):
+            return
+        cap, used, _peak = self.stream.ring_stats()
+        hot = cap > 0 and used >= RING_WARN * cap
+        if hot and not self.ring_hot:
+            self.ring_warns += 1
+        self.ring_hot = hot
+        if hot:
+            self.ring_warn_t = time.perf_counter()
+
     def poll(self):
         """Pull new data. Returns how many orders the engine processed."""
         n_orders, raw = self.stream.read()
+        self._check_ring()
         size = FILL_STRUCT.size
         for off in range(0, len(raw) - size + 1, size):
             egress_ns = time.perf_counter_ns()  # egress timestamp
@@ -592,10 +645,18 @@ class EngineWorker(threading.Thread):
             sla_checked = r.sla_checked
             sla_breaches = r.sla_breaches
             last_breach_t = r.last_breach_t
+            ring_raw = None
+            if hasattr(r.stream, "ring_stats"):
+                cap, used, ring_peak = r.stream.ring_stats()
+                ring_raw = (cap, used, ring_peak, r.ring_warns, r.ring_warn_t)
 
         now = time.perf_counter()
         breach_age = None if last_breach_t is None else now - last_breach_t
         whale_age = None if last_whale_t is None else now - last_whale_t
+        ring = None
+        if ring_raw is not None:
+            warn_age = None if ring_raw[4] is None else now - ring_raw[4]
+            ring = (*ring_raw[:4], warn_age)
 
         return Snapshot(
             book=book, rate=rate, peak=peak, total=total, fills=fills,
@@ -603,12 +664,91 @@ class EngineWorker(threading.Thread):
             whale_total=whale_total, whale=whale, whale_age=whale_age,
             latency=latency_stats(samples), polls=polls,
             clock_errors=clock_errors, sla_checked=sla_checked,
-            sla_breaches=sla_breaches, breach_age=breach_age,
+            sla_breaches=sla_breaches, breach_age=breach_age, ring=ring,
         )
 
     def stop(self):
         self.stop_event.set()
         self.join(timeout=1.0)
+
+
+# ----------------------------------------------------- system telemetry
+
+def read_rss_mb():
+    """Current resident memory of this process in MB, or None.
+
+    Uses `ps`, which exists on macOS and Linux, because the standard
+    library can only report the *peak* (see peak_rss_mb).
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            capture_output=True, text=True, timeout=1,
+        )
+        return int(out.stdout.strip()) / 1024  # ps reports kilobytes
+    except Exception:
+        return None
+
+
+def peak_rss_mb():
+    """Highest resident memory this process has used, in MB, or None."""
+    try:
+        import resource  # Unix only
+        value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes, Linux reports kilobytes
+        return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
+    except Exception:
+        return None
+
+
+class Telemetry(threading.Thread):
+    """Samples this process's CPU and memory once a second.
+
+    CPU is the share of one core used by the whole process, so 100% means
+    one core fully busy and more than 100% means several threads at work.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.start_t = time.perf_counter()
+        self.cpu = None                 # needs two samples, so empty at first
+        self.rss_mb = read_rss_mb()
+
+    def run(self):
+        last_wall = time.perf_counter()
+        last_cpu = time.process_time()
+        while not self.stop_event.wait(TELEMETRY_S):
+            try:
+                wall = time.perf_counter()
+                cpu_time = time.process_time()
+                span = wall - last_wall
+                cpu = (cpu_time - last_cpu) / span * 100 if span > 0 else None
+                last_wall, last_cpu = wall, cpu_time
+                rss = read_rss_mb()
+                with self.lock:
+                    self.cpu = cpu
+                    self.rss_mb = rss
+            except Exception:
+                pass  # a failed sample must never kill the dashboard
+
+    def snapshot(self):
+        with self.lock:
+            cpu, rss = self.cpu, self.rss_mb
+        try:
+            load = os.getloadavg()
+        except (OSError, AttributeError):
+            load = None
+        return Health(
+            cpu=cpu, load=load, cores=os.cpu_count() or 1, rss_mb=rss,
+            peak_mb=peak_rss_mb(), threads=threading.active_count(),
+            uptime=time.perf_counter() - self.start_t,
+        )
+
+    def stop(self):
+        self.stop_event.set()
+        self.join(timeout=1.5)
 
 
 class LogView:
@@ -689,8 +829,10 @@ def put(win, y, x, text, attr=0):
 def build_windows(stdscr):
     """Create the sub-windows for the current size, or None if too small.
 
-    Wide terminals get the log and the histogram side by side. Narrow ones
-    get both windows on the same spot and show one at a time (key: h).
+    Wide terminals show everything at once: three panels on top (order
+    book, metrics, system health) and the log next to the histogram below.
+    Narrower ones show the health, log and histogram windows on the same
+    spot, one at a time (key: h).
     """
     h, w = stdscr.getmaxyx()
     if h < MIN_H or w < MIN_W:
@@ -707,15 +849,20 @@ def build_windows(stdscr):
     try:
         wins = {
             "header": curses.newwin(header_h, w, 0, 0),
-            "book": curses.newwin(top_h, left_w, header_h, 0),
-            "metrics": curses.newwin(top_h, w - left_w, header_h, left_w),
             "footer": curses.newwin(footer_h, w, h - 1, 0),
             "wide": wide,
         }
         if wide:
+            health_x = 2 * TOP_COL_W
+            wins["book"] = curses.newwin(top_h, TOP_COL_W, header_h, 0)
+            wins["metrics"] = curses.newwin(top_h, TOP_COL_W, header_h, TOP_COL_W)
+            wins["health"] = curses.newwin(top_h, w - health_x, header_h, health_x)
             wins["log"] = curses.newwin(log_h, LOG_W, y, 0)
             wins["hist"] = curses.newwin(log_h, w - LOG_W, y, LOG_W)
         else:
+            wins["book"] = curses.newwin(top_h, left_w, header_h, 0)
+            wins["metrics"] = curses.newwin(top_h, w - left_w, header_h, left_w)
+            wins["health"] = curses.newwin(log_h, w, y, 0)
             wins["log"] = curses.newwin(log_h, w, y, 0)
             wins["hist"] = curses.newwin(log_h, w, y, 0)
         return wins
@@ -866,6 +1013,97 @@ def draw_metrics(win, snap):
     elif lat.pct["p99.9"] is None:
         need = min_samples(999)
         put(win, 13, 2, f"p99.9 needs {need:,} samples", curses.A_DIM)
+
+    win.noutrefresh()
+
+
+def bar_text(frac, width):
+    """A [####....] bar for a fraction between 0 and 1."""
+    frac = min(max(frac, 0.0), 1.0)
+    filled = int(round(frac * width))
+    return "[" + "#" * filled + "." * max(0, width - filled) + "]"
+
+
+def fmt_uptime(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def draw_health(win, snap, health):
+    """System health: process CPU and memory, ring buffer fill, counters."""
+    draw_panel(win, "System Health")
+    h, w = win.getmaxyx()
+
+    lines = []  # (text, attr); (None, 0) is a blank separator line
+
+    # --- process CPU and memory
+    cpu = health.cpu if health else None
+    cpu_txt = f"{cpu:.1f}%" if cpu is not None else "--"
+    bw = max(0, w - 4 - 16 - 2)
+    lines.append((f"{'CPU':<8}{cpu_txt:>7} {bar_text((cpu or 0) / 100, bw)}",
+                  curses.A_BOLD))
+
+    rss = health.rss_mb if health else None
+    peak = health.peak_mb if health else None
+    lines.append((
+        f"{'Memory':<8}"
+        f"{f'{rss:.1f} MB' if rss is not None else '--'}  "
+        f"(peak {f'{peak:.1f}' if peak is not None else '--'})", 0))
+
+    if health and health.load:
+        l1, l5, l15 = health.load
+        lines.append((f"{'Load':<8}{l1:.2f} {l5:.2f} {l15:.2f}  "
+                      f"({health.cores} cores)", 0))
+    else:
+        lines.append((f"{'Load':<8}n/a", curses.A_DIM))
+
+    if health:
+        lines.append((f"{'Threads':<8}{health.threads}   "
+                      f"up {fmt_uptime(health.uptime)}", 0))
+    lines.append((None, 0))
+
+    # --- shared-memory ring buffer
+    lines.append(("Shared memory ring (mock)", curses.A_BOLD))
+    if snap.ring is None:
+        lines.append(("no ring buffer data", curses.A_DIM))
+    else:
+        cap, used, ring_peak, warns, warn_age = snap.ring
+        frac = used / cap if cap else 0.0
+        hot = warn_age is not None and warn_age <= RING_FLASH_S
+        blink = int(time.perf_counter() * 4) % 2 == 0
+
+        bar_attr = 0
+        if hot:
+            bar_attr = curses.A_BOLD | (curses.A_REVERSE if blink else 0)
+        lines.append((f"{frac * 100:5.1f}% "
+                      f"{bar_text(frac, max(0, w - 4 - 7 - 2))}", bar_attr))
+        lines.append((f"backlog {used:,}/{cap:,}  "
+                      f"peak {ring_peak / cap * 100:.0f}%", 0))
+        if hot:
+            attr = COLORS["cancel"] | curses.A_BOLD
+            if blink:
+                attr |= curses.A_REVERSE
+            lines.append((f"!! HIGH WATERMARK >{RING_WARN * 100:.0f}% !!", attr))
+        else:
+            alerts = f"  ({warns} alerts)" if warns else ""
+            lines.append((f"Watermark OK{alerts}", curses.A_BOLD))
+    lines.append((None, 0))
+
+    # --- trade counters
+    n_fills = snap.fill_total - snap.cancel_total
+    lines.append((f"{'Orders':<8}{snap.total:,}", 0))
+    lines.append((f"{'Fills':<8}{n_fills:,}   cancels {snap.cancel_total:,}", 0))
+    lines.append((f"{'Whales':<8}{snap.whale_total:,}   "
+                  f"SLA breaches {snap.sla_breaches:,}", 0))
+
+    # on a short panel: drop the blank lines first, then the last rows
+    avail = h - 2
+    if len(lines) > avail:
+        lines = [ln for ln in lines if ln[0] is not None]
+    for i, (text, attr) in enumerate(lines[:avail]):
+        if text is not None:
+            put(win, 1 + i, 2, text, attr)
 
     win.noutrefresh()
 
@@ -1021,7 +1259,7 @@ def draw_footer(win, text):
     win.noutrefresh()
 
 
-def draw(wins, snap, view, stats_text, bottom, spread_dir):
+def draw(wins, snap, view, stats_text, bottom, spread_dir, health):
     ws = whale_state(snap)
 
     draw_header(wins["header"], snap, stats_text, ws)
@@ -1029,15 +1267,18 @@ def draw(wins, snap, view, stats_text, bottom, spread_dir):
     draw_metrics(wins["metrics"], snap)
 
     if wins["wide"]:
+        draw_health(wins["health"], snap, health)
         draw_log(wins["log"], snap, view)
         draw_hist(wins["hist"], snap)
         footer = "q quit  Up/Dn PgUp/PgDn scroll log  f/End follow  w test whale"
     else:
         if bottom == "hist":
             draw_hist(wins["hist"], snap)
+        elif bottom == "health":
+            draw_health(wins["health"], snap, health)
         else:
             draw_log(wins["log"], snap, view)
-        footer = "q quit  Up/Dn PgUp/PgDn scroll  f follow  h log/hist  w whale"
+        footer = "q quit  Up/Dn scroll  f follow  h log/hist/health  w whale"
 
     draw_footer(wins["footer"], footer)
     curses.doupdate()
@@ -1064,6 +1305,9 @@ def handle_resize(stdscr):
 
 # --------------------------------------------------------------- main
 
+BOTTOM_VIEWS = ("log", "hist", "health")
+
+
 def main(stdscr, args):
     curses.curs_set(0)
     init_colors(USE_COLOR)
@@ -1073,14 +1317,17 @@ def main(stdscr, args):
     wins = build_windows(stdscr)
     view = LogView()
     spread = SpreadTracker()
-    bottom = "log"  # which panel a narrow terminal shows: "log" or "hist"
+    bottom = "log"  # bottom panel on a narrow terminal: log, hist or health
 
     worker = EngineWorker(EngineReader(make_stream(args)))
     worker.start()
+    telemetry = Telemetry()
+    telemetry.start()
 
     fps = 0.0
     poll_rate = 0.0
     snap = None
+    health = None
     start_t = time.perf_counter()
     last_t = start_t
     last_polls = 0
@@ -1088,6 +1335,7 @@ def main(stdscr, args):
     try:
         while worker.error is None:
             snap = worker.snapshot()
+            health = telemetry.snapshot()
 
             now = time.perf_counter()
             dt = now - last_t
@@ -1104,7 +1352,8 @@ def main(stdscr, args):
                 draw_too_small(stdscr)
             else:
                 stats_text = f"UI {fps:4.1f} fps | engine {poll_rate:,.0f} polls/s"
-                draw(wins, snap, view, stats_text, bottom, spread.active(now))
+                draw(wins, snap, view, stats_text, bottom,
+                     spread.active(now), health)
 
             if args.duration is not None and now - start_t >= args.duration:
                 break
@@ -1123,7 +1372,8 @@ def main(stdscr, args):
             elif key in (ord("f"), ord("F"), curses.KEY_END):
                 view.resume()
             elif key in (ord("h"), ord("H")):
-                bottom = "hist" if bottom == "log" else "log"
+                i = BOTTOM_VIEWS.index(bottom)
+                bottom = BOTTOM_VIEWS[(i + 1) % len(BOTTOM_VIEWS)]
             elif key in (ord("w"), ord("W")):
                 stream = worker.reader.stream
                 if hasattr(stream, "request_whale"):  # mock source only
@@ -1133,8 +1383,9 @@ def main(stdscr, args):
                 wins, size = handle_resize(stdscr)
     finally:
         worker.stop()
+        telemetry.stop()
 
-    return worker.error, snap
+    return worker.error, snap, health
 
 
 def pct_text(value):
@@ -1144,7 +1395,7 @@ def pct_text(value):
 if __name__ == "__main__":
     args = build_parser().parse_args()
     apply_args(args)
-    error, last = curses.wrapper(main, args)
+    error, last, health = curses.wrapper(main, args)
     if error:
         raise error
     if last:
@@ -1158,6 +1409,19 @@ if __name__ == "__main__":
             f"(including {last.whale_total:,} whale sweeps), "
             f"{last.cancel_total:,} cancels"
         )
+        if health:
+            cpu = f"{health.cpu:.0f}%" if health.cpu is not None else "--"
+            peak = f"{health.peak_mb:.1f} MB" if health.peak_mb is not None else "--"
+            print(
+                f"Process: peak memory {peak}, CPU {cpu} of one core "
+                f"(last sample), {health.threads} threads, {health.cores} cores"
+            )
+        if last.ring:
+            cap, _used, ring_peak, warns, _age = last.ring
+            print(
+                f"Ring buffer (mock): peak {ring_peak / cap * 100:.0f}% full, "
+                f"{warns} high-watermark alerts"
+            )
         if last.sla_checked:
             print(
                 f"SLA (> {SLA_US:g} us): {last.sla_breaches:,} breaches out of "
