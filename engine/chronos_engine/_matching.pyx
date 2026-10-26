@@ -849,6 +849,20 @@ cdef class OrderBook:
         finally:
             self._release()
 
+    def is_crossed(self):
+        """Return True when best bid is at or above best ask."""
+        cdef PriceLevel* bid
+        cdef PriceLevel* ask
+        self._acquire()
+        try:
+            bid = side_best(&self._book.bids)
+            ask = side_best(&self._book.asks)
+            if bid == NULL or ask == NULL:
+                return False
+            return bid.price >= ask.price
+        finally:
+            self._release()
+
     def spread(self):
         """best ask - best bid, or None when one side is empty."""
         cdef PriceLevel* bid
