@@ -138,3 +138,23 @@ def test_spoofing_attack_generation():
     fake_ids = [b.order_id for b in unpacked_bids]
     cancel_ids = [c.order_id for c in unpacked_cancels]
     assert fake_ids == cancel_ids
+
+
+def test_quote_stuffing_burst_generation():
+    sim = MarketSimulator(symbols=["TSLA"])
+    packets = sim.generate_quote_stuffing_burst("TSLA", burst_size=25, price_offset=2.0)
+
+    # 25 adds + 25 cancels = 50 packets
+    assert len(packets) == 50
+
+    unpacked = [unpack_order(p) for p in packets]
+    adds = [o for o in unpacked if o.quantity > 0]
+    cancels = [o for o in unpacked if o.quantity == 0]
+
+    assert len(adds) == 25
+    assert len(cancels) == 25
+
+    # Confirm adds and cancels share matching order IDs
+    add_ids = [o.order_id for o in adds]
+    cancel_ids = [o.order_id for o in cancels]
+    assert add_ids == cancel_ids

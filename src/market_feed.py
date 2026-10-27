@@ -249,3 +249,28 @@ class MarketSimulator:
             cancellations.append(pack_order(oid, b"B", 0.0, 0, now_ns + 1500))
 
         return fake_bids, real_sell, cancellations
+
+
+    def generate_quote_stuffing_burst(
+        self,
+        symbol: str,
+        burst_size: int = 100,
+        price_offset: float = 5.0,
+    ) -> List[bytes]:
+        if symbol not in self.asset_prices:
+            self.asset_prices[symbol] = 150.0
+
+        base_px = self.asset_prices[symbol]
+        now_ns = time.perf_counter_ns()
+        stuffed_packets: List[bytes] = []
+
+        for i in range(burst_size):
+            self.order_counter += 1
+            oid = self.order_counter
+            deep_bid_px = max(0.01, round(base_px - price_offset - (i * 0.01), 2))
+            
+            # Rapid microsecond-spaced ADD followed by immediate CANCEL
+            stuffed_packets.append(pack_order(oid, b"B", deep_bid_px, 1, now_ns + (i * 100)))
+            stuffed_packets.append(pack_order(oid, b"B", 0.0, 0, now_ns + (i * 100) + 50))
+
+        return stuffed_packets
