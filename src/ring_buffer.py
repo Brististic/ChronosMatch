@@ -3,7 +3,7 @@ import mmap
 import struct
 from typing import List, Tuple
 
-HEADER_FORMAT = "<IIIII"
+HEADER_FORMAT = "<IIIIQ"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 DEFAULT_SLOT_SIZE = 29
 
