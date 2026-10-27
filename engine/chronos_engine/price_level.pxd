@@ -10,12 +10,13 @@ Time priority  : at the same price, the order that arrived first is matched firs
 All operations are plain C (noexcept nogil): no Python objects, no GC.
 Every operation is O(1).
 """
-from libc.stdint cimport uint8_t, uint32_t, uint64_t
+from libc.stdint cimport int64_t, uint8_t, uint32_t, uint64_t
 
 from chronos_engine.order_types cimport OrderNode, SIDE_BUY
 
 
 cdef struct PriceLevel:
+    int64_t tick                # price as an integer number of ticks (Day 8; 0 when unused)
     double price
     uint64_t total_quantity     # sum of remaining quantity of all resting orders
     uint32_t order_count
@@ -23,7 +24,8 @@ cdef struct PriceLevel:
     OrderNode* tail             # NEWEST order: last in line
 
 
-cdef inline void level_init(PriceLevel* lvl, double price) noexcept nogil:
+cdef inline void level_init(PriceLevel* lvl, double price, int64_t tick) noexcept nogil:
+    lvl.tick = tick
     lvl.price = price
     lvl.total_quantity = 0
     lvl.order_count = 0

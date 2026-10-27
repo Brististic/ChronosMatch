@@ -1,3 +1,4 @@
+
 """Day 4 tests: limit order book insertion and cancellation.
 
 Run from the engine/ folder after building:
@@ -44,6 +45,31 @@ class TestInsert(unittest.TestCase):
         book.insert(2, S, 100.25, 10)
         self.assertAlmostEqual(book.spread(), 0.75)
 
+    def test_empty_one_side_has_no_spread(self):
+        bid_book = OrderBook()
+        bid_book.insert(1, B, 100.0, 10)
+
+        self.assertEqual(bid_book.best_bid(), (100.0, 10))
+        self.assertIsNone(bid_book.best_ask())
+        self.assertIsNone(bid_book.spread())
+
+        ask_book = OrderBook()
+        ask_book.insert(2, S, 101.0, 5)
+
+        self.assertIsNone(ask_book.best_bid())
+        self.assertEqual(ask_book.best_ask(), (101.0, 5))
+        self.assertIsNone(ask_book.spread())
+
+    def test_crossed_book_has_negative_spread(self):
+        book = OrderBook()
+        book.insert(1, B, 101.0, 10)
+        book.insert(2, S, 100.0, 10)
+
+        self.assertEqual(book.best_bid(), (101.0, 10))
+        self.assertEqual(book.best_ask(), (100.0, 10))
+        self.assertAlmostEqual(book.spread(), -1.0)
+        self.assertTrue(book.check_integrity())
+
     def test_same_price_keeps_arrival_order(self):
         book = OrderBook()
         for oid, qty in ((10, 100), (11, 200), (12, 300)):
@@ -75,6 +101,39 @@ class TestInsert(unittest.TestCase):
         for oid in (0, 1, 2**63, 2**64 - 1):
             self.assertIn(oid, book)
         self.assertTrue(book.check_integrity())
+
+
+class TestCrossedBook(unittest.TestCase):
+    def test_empty_book_is_not_crossed(self):
+        self.assertFalse(OrderBook().is_crossed())
+
+    def test_bid_only_book_is_not_crossed(self):
+        book = OrderBook()
+        book.insert(1, B, 100.0, 10)
+        self.assertFalse(book.is_crossed())
+
+    def test_ask_only_book_is_not_crossed(self):
+        book = OrderBook()
+        book.insert(1, S, 101.0, 10)
+        self.assertFalse(book.is_crossed())
+
+    def test_normal_book_is_not_crossed(self):
+        book = OrderBook()
+        book.insert(1, B, 99.0, 10)
+        book.insert(2, S, 101.0, 10)
+        self.assertFalse(book.is_crossed())
+
+    def test_crossed_book_is_crossed(self):
+        book = OrderBook()
+        book.insert(1, B, 102.0, 10)
+        book.insert(2, S, 101.0, 10)
+        self.assertTrue(book.is_crossed())
+
+    def test_equal_prices_are_crossed(self):
+        book = OrderBook()
+        book.insert(1, B, 100.0, 10)
+        book.insert(2, S, 100.0, 10)
+        self.assertTrue(book.is_crossed())
 
 
 class TestValidation(unittest.TestCase):
@@ -138,6 +197,7 @@ class TestCancel(unittest.TestCase):
         self.assertTrue(book.cancel(2))
         self.assertIsNone(book.best_bid())
         self.assertEqual(book.level_count(B), 0)
+        self.assertTrue(book.check_integrity())
 
     def test_cancel_unknown_and_double_cancel(self):
         book = OrderBook()
@@ -150,9 +210,9 @@ class TestCancel(unittest.TestCase):
         book = OrderBook()
         for oid in range(1, 7):
             book.insert(oid, S, 100.0, oid * 10)
-        book.cancel(1)   # head
-        book.cancel(4)   # middle
-        book.cancel(6)   # tail
+        book.cancel(1)
+        book.cancel(4)
+        book.cancel(6)
         self.assertEqual(book.level_orders(S, 100.0), [(2, 20), (3, 30), (5, 50)])
         self.assertTrue(book.check_integrity())
 
@@ -214,9 +274,10 @@ class TestAgainstReferenceModel(unittest.TestCase):
     def test_random_operations(self):
         rng = random.Random(4)
         book = OrderBook()
-        live = {}                       # id -> (side, price, qty)
-        order_in_level = {}             # (side, price) -> [ids in arrival order]
+        live = {}
+        order_in_level = {}
         next_id = 1
+
         for step in range(20000):
             if live and rng.random() < 0.45:
                 oid = rng.choice(list(live)) if step % 50 == 0 else next(iter(live))
@@ -231,17 +292,30 @@ class TestAgainstReferenceModel(unittest.TestCase):
                 live[next_id] = (side, price, qty)
                 order_in_level.setdefault((side, price), []).append(next_id)
                 next_id += 1
+
             if step % 500 == 0:
                 self.assertTrue(book.check_integrity())
+
         self.assertEqual(len(book), len(live))
+
         for side in (B, S):
-            prices = sorted({p for (s, p), ids in order_in_level.items() if s == side and ids},
-                            reverse=(side == B))
-            expected = [(p, sum(live[i][2] for i in order_in_level[(side, p)]),
-                         len(order_in_level[(side, p)])) for p in prices]
+            prices = sorted(
+                {p for (s, p), ids in order_in_level.items() if s == side and ids},
+                reverse=(side == B),
+            )
+            expected = [
+                (p, sum(live[i][2] for i in order_in_level[(side, p)]),
+                 len(order_in_level[(side, p)]))
+                for p in prices
+            ]
             self.assertEqual(book.depth(side, 1000), expected)
+
             for p in prices:
-                self.assertEqual([x[0] for x in book.level_orders(side, p)], order_in_level[(side, p)])
+                self.assertEqual(
+                    [x[0] for x in book.level_orders(side, p)],
+                    order_in_level[(side, p)],
+                )
+
         self.assertTrue(book.check_integrity())
 
 

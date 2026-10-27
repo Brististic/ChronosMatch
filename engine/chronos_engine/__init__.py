@@ -2,7 +2,9 @@
 from ._matching import (
     LevelQueue,
     OrderBook,
+    RingConsumer,
     bench_insert_cancel,
+    bench_latency,
     bench_match,
     build_info,
     cpp_standard,
@@ -17,7 +19,9 @@ from ._matching import (
 __all__ = [
     "LevelQueue",
     "OrderBook",
+    "RingConsumer",
     "bench_insert_cancel",
+    "bench_latency",
     "bench_match",
     "build_info",
     "cpp_standard",
@@ -28,4 +32,4 @@ __all__ = [
     "selftest_linked_nodes",
     "selftest_nogil",
 ]
-__version__ = "0.6.0"
+__version__ = "0.12.0"

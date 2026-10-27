@@ -9,7 +9,8 @@ Optional environment switches:
     CHRONOS_ANNOTATE=1   write <module>.html reports (yellow lines = Python C-API calls;
                          used from Day 11 to strip Python interaction from the hot loop)
     CHRONOS_NATIVE=1     add -march=native (fastest on THIS machine, not portable)
-    CHRONOS_DEBUG=1      build with -O0 -g and force a clean rebuild
+    CHRONOS_DEBUG=1      build with -O0 -g, force a clean rebuild, and fill freed pool elements with 0xDD
+                         (so a read of freed memory shows up as a wrong value)
 """
 import os
 import sys
@@ -31,11 +32,13 @@ def flag(name: str) -> bool:
 # --------------------------------------------------------------------------
 if sys.platform == "win32":                       # MSVC
     compile_args = ["/std:c++17", "/Od" if flag("CHRONOS_DEBUG") else "/O2"]
+    if flag("CHRONOS_DEBUG"):
+        compile_args.append("/DCHRONOS_POOL_DEBUG")
     link_args = []
 else:                                             # GCC / Clang (Linux, macOS)
     compile_args = ["-std=c++17", "-Wall", "-Wno-unused-function"]
     if flag("CHRONOS_DEBUG"):
-        compile_args += ["-O0", "-g"]
+        compile_args += ["-O0", "-g", "-DCHRONOS_POOL_DEBUG"]
     else:
         compile_args += ["-O3", "-fno-strict-aliasing"]
         if flag("CHRONOS_NATIVE"):
@@ -73,7 +76,7 @@ directives = {
 
 setup(
     name="chronos-engine",
-    version="0.6.0",
+    version="0.12.0",
     description="ChronosMatch - Cython limit order book matching engine",
     packages=["chronos_engine"],
     package_data={"chronos_engine": ["*.pxd"]},   # ship headers so other modules can cimport them
