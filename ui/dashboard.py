@@ -1,5 +1,6 @@
 import argparse
 import curses
+import mmap
 import os
 import random
 import struct
@@ -10,7 +11,7 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import deque, namedtuple
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 # Defaults. The launch flags below can override the first four at startup.
 REFRESH_MS = 100       # UI refresh interval (about 10 frames/s)
@@ -19,6 +20,8 @@ TARGET_OPS = 100_000   # target throughput from the project plan
 LATENCY_BUFFER = 5000  # rolling window: how many latency samples are kept
 USE_COLOR = True       # flag: --no-color (also off if NO_COLOR is set)
 WHALE_EVERY_S = 12.0   # mock only: average seconds between whale sweeps
+SOURCE_LABEL = "mock"  # "mock" or "live" (set from --source)
+RING_PATH = "/tmp/chronosmatch_ring.bin"  # flag: --ring
 
 # SLA: a trade breaches it when its latency is strictly greater than this.
 SLA_NS = 50_000        # in nanoseconds (flag: --sla-us)
@@ -26,6 +29,7 @@ SLA_US = SLA_NS / 1000 # the same limit in microseconds
 FLASH_S = 1.5          # how long the breach alert flashes after a breach
 SHIFT_FLASH_S = 1.5    # how long a spread shift stays highlighted
 WHALE_FLASH_S = 3.0    # how long a whale sweep alert flashes
+STALE_S = 3.0          # live source: no events for this long = NO DATA
 
 TELEMETRY_S = 1.0      # how often CPU and memory are sampled
 RING_SLOTS = 65_536    # mock shared-memory ring capacity, in event slots
@@ -50,17 +54,19 @@ HIST_LO_FLOOR_US = 0.1 # lowest edge of the log-scale histogram
 # maths stays in whole numbers: 999 = 99.9th percentile.
 PCT_PERMILLE = (("p50", 500), ("p90", 900), ("p99", 990), ("p99.9", 999))
 
+# ---------------------------------------------------------------------
 # Binary layout of one engine event (a fill, a cancel or a whale sweep).
 # PLACEHOLDER: confirm the real layout with the IPC/engine members.
-#   kind       0 = fill, 1 = cancel, 2 = whale sweep
-#   levels     how many price levels the order swept (whale sweeps)
-#   ts_ns      wall-clock time of the event (for display)
-#   ingress_ns time.perf_counter_ns() stamped when the order entered the system
-FILL_STRUCT = struct.Struct("<QBBBIdQQ")
+#   kind        0 = fill, 1 = cancel, 2 = whale sweep
+#   levels      how many price levels the order swept (whale sweeps)
+#   ts_ns       wall-clock time of the event (for display)
+#   ingress_ns  time.perf_counter_ns() stamped when the order entered
+#   egress_ns   time.perf_counter_ns() stamped by the engine when the event
+#               left it. 0 = not stamped: the dashboard stamps it on read.
+FILL_STRUCT = struct.Struct("<QBBBIdQQQ")  # 47 bytes
 RawFill = namedtuple(
-    "RawFill", "order_id side kind levels qty price ts_ns ingress_ns"
+    "RawFill", "order_id side kind levels qty price ts_ns ingress_ns egress_ns"
 )
-# egress_ns is stamped by the UI reader when it decodes the event.
 # latency_ns = egress_ns - ingress_ns (None if the clocks disagree).
 Fill = namedtuple(
     "Fill",
@@ -69,20 +75,46 @@ Fill = namedtuple(
 SIDE_BUY, SIDE_SELL = 0, 1
 KIND_FILL, KIND_CANCEL, KIND_WHALE = 0, 1, 2
 
+# ---------------------------------------------------------------------
+# Layout of the shared-memory ring file (live source, --source shm).
+# PLACEHOLDER: confirm the real layout with Member 1 (ring buffer).
+#
+#   offset   0  header, 40 bytes: magic, version, slot_size, capacity,
+#               head (total events ever written), orders_total
+#   offset  64  book snapshot area, 512 bytes (written by the engine)
+#   offset 576  ring slots: slot i lives at 576 + (i % capacity) * slot_size
+#
+# The writer fills a slot first and only then increases `head`. The
+# dashboard keeps its own read position, so it never changes the file.
+RING_MAGIC = b"CHRONOS1"
+RING_VERSION = 1
+HDR_STRUCT = struct.Struct("<8sIIQQQ")  # magic, version, slot_size, capacity,
+HEAD_OFF = 24                           # head, orders_total
+ORDERS_OFF = 32
+BOOK_OFF = 64
+BOOK_LEVELS = 10                        # most price levels per side stored
+BOOK_ENTRY = struct.Struct("<dII")      # price, qty, padding (16 bytes)
+RING_OFFSET = 576
+MAX_BATCH = 20_000                      # most events read in one poll
+# Book area: seq (u64), n_bids (u32), n_asks (u32), then BOOK_LEVELS bid
+# entries and BOOK_LEVELS ask entries. seq is odd while the engine is
+# writing and even when the snapshot is complete (0 = never written).
+
 # n = samples in the window, pct = {"p50": value or None, ...},
 # ordered = all window samples in microseconds, sorted (feeds the histogram),
 # over = how many window samples are above the SLA
 LatencyStats = namedtuple("LatencyStats", "last avg min max n pct ordered over")
+# State of the ring buffer: backlog = events the dashboard has not read yet.
+RingInfo = namedtuple("RingInfo", "cap used peak warns warn_age dropped")
 # fill_total counts every event (fills, cancels and whales); cancel_total and
 # whale_total are parts of it. whale = (side, levels, qty, price) of the most
 # recent whale sweep, whale_age = seconds since it happened.
-# ring = None, or (capacity, used, peak_used, watermark_alerts, alert_age)
-# describing the shared-memory ring buffer.
+# event_age = seconds since the last event of any kind (None = none yet).
 Snapshot = namedtuple(
     "Snapshot",
     "book rate peak total fills fill_total cancel_total whale_total whale "
     "whale_age latency polls clock_errors sla_checked sla_breaches breach_age "
-    "ring",
+    "ring event_age",
 )
 # Resource use of this dashboard process (cpu = % of one core).
 Health = namedtuple("Health", "cpu load cores rss_mb peak_mb threads uptime")
@@ -126,7 +158,8 @@ def build_parser():
         description="ChronosMatch live latency dashboard (curses terminal UI).",
         epilog=(
             "examples:\n"
-            "  python3 ui/dashboard.py\n"
+            "  python3 ui/dashboard.py                      (mock data)\n"
+            "  python3 ui/dashboard.py --source shm         (live ring buffer)\n"
             "  python3 ui/dashboard.py --levels 8 --refresh-ms 50\n"
             "  python3 ui/dashboard.py --sla-us 30 --seed 42 --duration 30\n"
             "  python3 ui/dashboard.py --whale-every 5\n"
@@ -145,9 +178,13 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-s", "--source", choices=["mock"], default="mock",
-        help="data source (only 'mock' for now; the real engine is added "
-             "at integration)",
+        "-s", "--source", choices=["mock", "shm"], default="mock",
+        help="data source: 'mock' = built-in simulator, 'shm' = live "
+             "shared-memory ring buffer written by the engine (default mock)",
+    )
+    parser.add_argument(
+        "--ring", default=RING_PATH, metavar="PATH",
+        help=f"ring buffer file for --source shm (default {RING_PATH})",
     )
     parser.add_argument(
         "-r", "--refresh-ms", type=bounded_int(20, 1000), default=REFRESH_MS,
@@ -204,7 +241,7 @@ def build_parser():
 def apply_args(args):
     """Copy the launch options into the module settings the UI reads."""
     global REFRESH_MS, LEVELS, TARGET_OPS, LATENCY_BUFFER, SLA_NS, SLA_US
-    global USE_COLOR, WHALE_EVERY_S
+    global USE_COLOR, WHALE_EVERY_S, SOURCE_LABEL
     REFRESH_MS = args.refresh_ms
     LEVELS = args.levels
     TARGET_OPS = args.target_ops
@@ -212,6 +249,7 @@ def apply_args(args):
     SLA_NS = int(round(args.sla_us * 1000))
     SLA_US = SLA_NS / 1000
     WHALE_EVERY_S = args.whale_every
+    SOURCE_LABEL = "live" if args.source == "shm" else "mock"
     USE_COLOR = not args.no_color and not os.environ.get("NO_COLOR")
     if args.seed is not None:
         random.seed(args.seed)
@@ -248,21 +286,13 @@ class MockOrderBook:
             for i in range(LEVELS)
         ]
 
-    @property
-    def best_bid(self):
-        return self.bids[0][0]
-
-    @property
-    def best_ask(self):
-        return self.asks[0][0]
-
-    @property
-    def spread(self):
-        return round(self.best_ask - self.best_bid, 2)
-
 
 class BookSnapshot:
-    """Frozen copy of the book, safe to draw while the worker keeps running."""
+    """Frozen copy of the book, safe to draw while the worker keeps running.
+
+    The lists can be empty (the engine has not written a book yet), so the
+    best prices and the spread are None in that case.
+    """
 
     def __init__(self, bids, asks):
         self.bids = bids
@@ -270,26 +300,26 @@ class BookSnapshot:
 
     @property
     def best_bid(self):
-        return self.bids[0][0]
+        return self.bids[0][0] if self.bids else None
 
     @property
     def best_ask(self):
-        return self.asks[0][0]
+        return self.asks[0][0] if self.asks else None
 
     @property
     def spread(self):
-        return round(self.best_ask - self.best_bid, 2)
+        if not self.bids or not self.asks:
+            return None
+        return round(self.asks[0][0] - self.bids[0][0], 2)
 
 
 class MockEngineStream:
-    """Stands in for the engine output until the real one exists.
+    """Stands in for the engine output when no real engine is running.
 
-    Replace this class with the real stream. It needs:
+    A real source (see ShmEngineStream) needs the same three things:
       - read() -> (orders_processed: int, event_bytes: bytes)
-        where every event carries the ingress perf_counter_ns() stamp
       - book   -> object with .bids and .asks (lists of (price, qty))
-      - ring_stats() -> (capacity, used, peak_used) of the shared-memory
-        ring buffer (optional: the health panel shows 'no data' without it)
+      - ring_stats() -> (capacity, used, peak_used)  (optional)
     """
 
     def __init__(self, mid=150.00):
@@ -301,6 +331,7 @@ class MockEngineStream:
         self.ring_floor = int(0.09 * RING_SLOTS)  # resting backlog
         self.ring_used = self.ring_floor
         self.ring_peak = self.ring_used
+        self.dropped = 0
 
     def request_whale(self):
         """Ask for a test whale sweep (the 'w' key). Mock source only."""
@@ -311,16 +342,17 @@ class MockEngineStream:
         return RING_SLOTS, self.ring_used, self.ring_peak
 
     @staticmethod
-    def _ingress_ns():
-        """Backdate an ingress stamp by a mock engine latency (~25 us).
-        Spikes: 2% are 3x slower (about 75 us, an SLA breach), about 0.2%
-        are 10x slower."""
+    def _stamps():
+        """(ingress_ns, egress_ns) for a mock event: the engine took about
+        25 us. Spikes: 2% are 3x slower (about 75 us, an SLA breach), about
+        0.2% are 10x slower."""
         latency_us = max(1.0, random.gauss(25, 4))
         if random.random() < 0.02:
             latency_us *= 3
         if random.random() < 0.002:
             latency_us *= 10
-        return time.perf_counter_ns() - int(latency_us * 1000)
+        egress = time.perf_counter_ns()
+        return egress - int(latency_us * 1000), egress
 
     def _whale_record(self):
         """One big order that clears several price levels of the book."""
@@ -332,9 +364,10 @@ class MockEngineStream:
         price = book_side[levels - 1][0]             # deepest level reached
         order_id = self.next_id
         self.next_id += 1
+        ingress_ns, egress_ns = self._stamps()
         return FILL_STRUCT.pack(
             order_id, side, KIND_WHALE, levels, qty, price,
-            time.time_ns(), self._ingress_ns(),
+            time.time_ns(), ingress_ns, egress_ns,
         )
 
     def read(self):
@@ -365,9 +398,10 @@ class MockEngineStream:
                 price = (self.book.bids[0][0] if side == SIDE_SELL
                          else self.book.asks[0][0])
 
+            ingress_ns, egress_ns = self._stamps()
             raw += FILL_STRUCT.pack(
                 order_id, side, kind, 0, qty, price,
-                time.time_ns(), self._ingress_ns(),
+                time.time_ns(), ingress_ns, egress_ns,
             )
 
         if self.whale_requested or now >= self.next_whale_t:
@@ -392,10 +426,143 @@ class MockEngineStream:
         return n_orders, raw
 
 
+# --------------------------------------------------- live ring buffer
+
+class RingError(Exception):
+    """The ring buffer file is missing or does not have the expected layout."""
+
+
+class ShmEngineStream:
+    """Reads the engine's ring buffer from a memory-mapped file, read-only.
+
+    The dashboard keeps its own read position (cursor), so it never changes
+    the file and cannot disturb the engine. If the engine writes faster than
+    the dashboard reads and laps it, the lost events are counted in
+    `dropped` and the cursor jumps forward to the oldest event still there.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.file = open(path, "rb")
+        except OSError as exc:
+            raise RingError(
+                f"cannot open ring file {path!r}: {exc.strerror}. "
+                "Start the engine (or ui/fake_producer.py) first."
+            )
+        try:
+            self.mm = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError) as exc:
+            self.file.close()
+            raise RingError(f"cannot map ring file {path!r}: {exc}")
+
+        try:
+            if len(self.mm) < RING_OFFSET:
+                raise RingError(f"{path!r} is too small to be a ring buffer")
+            magic, version, slot_size, capacity, head, orders = (
+                HDR_STRUCT.unpack_from(self.mm, 0)
+            )
+            if magic != RING_MAGIC:
+                raise RingError(f"{path!r} is not a ChronosMatch ring "
+                                f"(bad magic {magic!r})")
+            if version != RING_VERSION:
+                raise RingError(f"ring version {version} is not supported "
+                                f"(expected {RING_VERSION})")
+            if slot_size < FILL_STRUCT.size or capacity == 0:
+                raise RingError(f"bad ring header: slot_size={slot_size}, "
+                                f"capacity={capacity}")
+            if len(self.mm) < RING_OFFSET + capacity * slot_size:
+                raise RingError("ring file is smaller than its header claims")
+        except RingError:
+            self.close()
+            raise
+
+        self.slot_size = slot_size
+        self.capacity = capacity
+        self.cursor = head          # only show events written from now on
+        self.last_orders = orders
+        self.dropped = 0
+        self.peak_used = 0
+        self._book = BookSnapshot([], [])
+
+    def close(self):
+        try:
+            self.mm.close()
+        except Exception:
+            pass
+        try:
+            self.file.close()
+        except Exception:
+            pass
+
+    def read(self):
+        """Return (orders_processed, event_bytes) for everything new."""
+        _m, _v, _s, _c, head, orders = HDR_STRUCT.unpack_from(self.mm, 0)
+
+        if head < self.cursor:      # the writer restarted its counters
+            self.cursor = head
+            self.last_orders = orders
+
+        backlog = head - self.cursor
+        if backlog > self.capacity:  # lapped by the writer: events were lost
+            self.dropped += backlog - self.capacity
+            self.cursor = head - self.capacity
+            backlog = self.capacity
+        self.peak_used = max(self.peak_used, backlog)
+
+        take = min(backlog, MAX_BATCH)
+        size = FILL_STRUCT.size
+        chunks = []
+        for i in range(self.cursor, self.cursor + take):
+            off = RING_OFFSET + (i % self.capacity) * self.slot_size
+            chunks.append(self.mm[off:off + size])
+        self.cursor += take
+
+        # the engine counts every order it processed; if it does not, fall
+        # back to the number of events read
+        if orders > 0:
+            n_orders = max(0, orders - self.last_orders)
+        else:
+            n_orders = take
+        self.last_orders = orders
+        return n_orders, b"".join(chunks)
+
+    def ring_stats(self):
+        """(capacity, used, peak_used): used = events not yet read."""
+        head = struct.unpack_from("<Q", self.mm, HEAD_OFF)[0]
+        used = min(max(0, head - self.cursor), self.capacity)
+        return self.capacity, used, max(self.peak_used, used)
+
+    @property
+    def book(self):
+        """Latest complete book snapshot written by the engine (seqlock)."""
+        for _ in range(4):
+            s1 = struct.unpack_from("<Q", self.mm, BOOK_OFF)[0]
+            if s1 == 0:             # never written
+                return self._book
+            if s1 & 1:              # the engine is writing: try again
+                continue
+            nb, na = struct.unpack_from("<II", self.mm, BOOK_OFF + 8)
+            nb, na = min(nb, BOOK_LEVELS), min(na, BOOK_LEVELS)
+            base = BOOK_OFF + 16
+            bids = [BOOK_ENTRY.unpack_from(self.mm, base + i * 16)[:2]
+                    for i in range(nb)]
+            ask_base = base + BOOK_LEVELS * 16
+            asks = [BOOK_ENTRY.unpack_from(self.mm, ask_base + i * 16)[:2]
+                    for i in range(na)]
+            s2 = struct.unpack_from("<Q", self.mm, BOOK_OFF)[0]
+            if s1 == s2:            # nothing changed while we read it
+                self._book = BookSnapshot(bids, asks)
+                return self._book
+        return self._book           # keep the last good snapshot
+
+
 def make_stream(args):
     """Create the data source chosen with --source."""
     if args.source == "mock":
         return MockEngineStream(args.mid_price)
+    if args.source == "shm":
+        return ShmEngineStream(args.ring)
     raise ValueError(f"unknown source: {args.source}")
 
 
@@ -411,6 +578,7 @@ class EngineReader:
         self.whale_total = 0        # of those, how many were whale sweeps
         self.last_whale = None      # (side, levels, qty, price)
         self.last_whale_t = None    # perf_counter() time of the latest whale
+        self.last_event_t = None    # perf_counter() time of the latest event
         self.clock_errors = 0
         self.sla_checked = 0        # events with a valid latency
         self.sla_breaches = 0       # of those, how many exceeded the SLA
@@ -441,9 +609,11 @@ class EngineReader:
         self._check_ring()
         size = FILL_STRUCT.size
         for off in range(0, len(raw) - size + 1, size):
-            egress_ns = time.perf_counter_ns()  # egress timestamp
             rf = RawFill(*FILL_STRUCT.unpack_from(raw, off))
 
+            # prefer the engine's own egress stamp; if it left it empty,
+            # stamp the moment the dashboard read the event
+            egress_ns = rf.egress_ns or time.perf_counter_ns()
             latency_ns = egress_ns - rf.ingress_ns
             if latency_ns < 0:
                 # egress before ingress means the clocks disagree: don't
@@ -457,8 +627,9 @@ class EngineReader:
                     self.sla_breaches += 1
                     self.last_breach_t = time.perf_counter()
 
-            self.fills.append(Fill(*rf, egress_ns, latency_ns))
+            self.fills.append(Fill(*rf._replace(egress_ns=egress_ns), latency_ns))
             self.fill_total += 1
+            self.last_event_t = time.perf_counter()
             if rf.kind == KIND_CANCEL:
                 self.cancel_total += 1
             elif rf.kind == KIND_WHALE:
@@ -577,6 +748,13 @@ def whale_state(snap):
     return snap.whale, int(snap.whale_age * 5) % 2 == 0, snap.whale_age
 
 
+def no_data(snap):
+    """True when a live source has gone quiet (or never started)."""
+    if SOURCE_LABEL != "live":
+        return False
+    return snap.event_age is None or snap.event_age > STALE_S
+
+
 class SpreadTracker:
     """Notices when the best bid/ask spread changes between frames."""
 
@@ -586,6 +764,8 @@ class SpreadTracker:
         self.direction = 0  # +1 widened, -1 tightened
 
     def update(self, spread, now):
+        if spread is None:  # no book yet
+            return
         if self.last is not None and abs(spread - self.last) > 1e-9:
             self.direction = 1 if spread > self.last else -1
             self.changed_t = now
@@ -629,7 +809,8 @@ class EngineWorker(threading.Thread):
         work (sorting for percentiles) after the lock is released."""
         with self.lock:
             r = self.reader
-            book = BookSnapshot(list(r.book.bids), list(r.book.asks))
+            live_book = r.book
+            book = BookSnapshot(list(live_book.bids), list(live_book.asks))
             fills = list(r.fills)
             samples = list(r.latencies)
             rate = self.meter.rate
@@ -640,6 +821,7 @@ class EngineWorker(threading.Thread):
             whale_total = r.whale_total
             whale = r.last_whale
             last_whale_t = r.last_whale_t
+            last_event_t = r.last_event_t
             polls = self.polls
             clock_errors = r.clock_errors
             sla_checked = r.sla_checked
@@ -648,15 +830,18 @@ class EngineWorker(threading.Thread):
             ring_raw = None
             if hasattr(r.stream, "ring_stats"):
                 cap, used, ring_peak = r.stream.ring_stats()
-                ring_raw = (cap, used, ring_peak, r.ring_warns, r.ring_warn_t)
+                ring_raw = (cap, used, ring_peak, r.ring_warns, r.ring_warn_t,
+                            getattr(r.stream, "dropped", 0))
 
         now = time.perf_counter()
         breach_age = None if last_breach_t is None else now - last_breach_t
         whale_age = None if last_whale_t is None else now - last_whale_t
+        event_age = None if last_event_t is None else now - last_event_t
         ring = None
         if ring_raw is not None:
             warn_age = None if ring_raw[4] is None else now - ring_raw[4]
-            ring = (*ring_raw[:4], warn_age)
+            ring = RingInfo(ring_raw[0], ring_raw[1], ring_raw[2], ring_raw[3],
+                            warn_age, ring_raw[5])
 
         return Snapshot(
             book=book, rate=rate, peak=peak, total=total, fills=fills,
@@ -665,6 +850,7 @@ class EngineWorker(threading.Thread):
             latency=latency_stats(samples), polls=polls,
             clock_errors=clock_errors, sla_checked=sla_checked,
             sla_breaches=sla_breaches, breach_age=breach_age, ring=ring,
+            event_age=event_age,
         )
 
     def stop(self):
@@ -900,7 +1086,9 @@ def draw_header(win, snap, stats_text, ws):
         stats_x = max(0, w - len(stats_text) - 3)
         put(win, 0, stats_x, stats_text)
         flashing, on = breach_state(snap)
-        if flashing and stats_x - 34 >= 13:  # only when there is room for it
+        if no_data(snap) and stats_x - 34 >= 11:
+            put(win, 0, 34, " NO DATA ", curses.A_REVERSE | curses.A_BOLD)
+        elif flashing and stats_x - 34 >= 13:  # only when there is room for it
             put(win, 0, 34, " SLA BREACH ",
                 curses.A_REVERSE if on else curses.A_BOLD)
 
@@ -928,6 +1116,8 @@ def draw_book(win, book, spread_dir, ws):
     # asks: furthest level on top, best ask just above the spread row.
     # A buy sweep clears the asks.
     for i in range(levels):
+        if i >= len(book.asks):
+            continue
         row = 2 + (levels - 1 - i)
         price, qty = book.asks[i]
         if sweep_side == SIDE_BUY and i < sweep_n:
@@ -937,16 +1127,21 @@ def draw_book(win, book, spread_dir, ws):
 
     # spread row in the middle, yellow for a moment after the spread shifts
     spread_row = 2 + levels
-    if spread_dir:
+    spread = book.spread
+    if spread is None:
+        put(win, spread_row, 2, "-- waiting for book data --", curses.A_DIM)
+    elif spread_dir:
         word = "^ widened" if spread_dir > 0 else "v tightened"
-        put(win, spread_row, 2, f"-- spread {book.spread:.2f}  {word} --",
+        put(win, spread_row, 2, f"-- spread {spread:.2f}  {word} --",
             COLORS["spread"])
     else:
-        put(win, spread_row, 2, f"-- spread {book.spread:.2f} --", curses.A_BOLD)
+        put(win, spread_row, 2, f"-- spread {spread:.2f} --", curses.A_BOLD)
 
     # bids: best bid just below the spread row, then going down.
     # A sell sweep clears the bids.
     for i in range(levels):
+        if i >= len(book.bids):
+            continue
         row = spread_row + 1 + i
         price, qty = book.bids[i]
         if sweep_side == SIDE_SELL and i < sweep_n:
@@ -1064,13 +1259,13 @@ def draw_health(win, snap, health):
     lines.append((None, 0))
 
     # --- shared-memory ring buffer
-    lines.append(("Shared memory ring (mock)", curses.A_BOLD))
-    if snap.ring is None:
+    lines.append((f"Shared memory ring ({SOURCE_LABEL})", curses.A_BOLD))
+    ri = snap.ring
+    if ri is None:
         lines.append(("no ring buffer data", curses.A_DIM))
     else:
-        cap, used, ring_peak, warns, warn_age = snap.ring
-        frac = used / cap if cap else 0.0
-        hot = warn_age is not None and warn_age <= RING_FLASH_S
+        frac = ri.used / ri.cap if ri.cap else 0.0
+        hot = ri.warn_age is not None and ri.warn_age <= RING_FLASH_S
         blink = int(time.perf_counter() * 4) % 2 == 0
 
         bar_attr = 0
@@ -1078,15 +1273,18 @@ def draw_health(win, snap, health):
             bar_attr = curses.A_BOLD | (curses.A_REVERSE if blink else 0)
         lines.append((f"{frac * 100:5.1f}% "
                       f"{bar_text(frac, max(0, w - 4 - 7 - 2))}", bar_attr))
-        lines.append((f"backlog {used:,}/{cap:,}  "
-                      f"peak {ring_peak / cap * 100:.0f}%", 0))
+        peak_pct = ri.peak / ri.cap * 100 if ri.cap else 0.0
+        lines.append((f"backlog {ri.used:,}/{ri.cap:,}  peak {peak_pct:.0f}%", 0))
+        if ri.dropped:
+            lines.append((f"DROPPED {ri.dropped:,} events",
+                          COLORS["cancel"] | curses.A_BOLD | curses.A_REVERSE))
         if hot:
             attr = COLORS["cancel"] | curses.A_BOLD
             if blink:
                 attr |= curses.A_REVERSE
             lines.append((f"!! HIGH WATERMARK >{RING_WARN * 100:.0f}% !!", attr))
         else:
-            alerts = f"  ({warns} alerts)" if warns else ""
+            alerts = f"  ({ri.warns} alerts)" if ri.warns else ""
             lines.append((f"Watermark OK{alerts}", curses.A_BOLD))
     lines.append((None, 0))
 
@@ -1096,6 +1294,12 @@ def draw_health(win, snap, health):
     lines.append((f"{'Fills':<8}{n_fills:,}   cancels {snap.cancel_total:,}", 0))
     lines.append((f"{'Whales':<8}{snap.whale_total:,}   "
                   f"SLA breaches {snap.sla_breaches:,}", 0))
+    if snap.event_age is None:
+        lines.append(("Last event: none yet", curses.A_DIM))
+    else:
+        stale = SOURCE_LABEL == "live" and snap.event_age > STALE_S
+        lines.append((f"Last event {snap.event_age:.1f}s ago",
+                      curses.A_REVERSE if stale else 0))
 
     # on a short panel: drop the blank lines first, then the last rows
     avail = h - 2
@@ -1231,7 +1435,7 @@ def draw_log(win, snap, view):
         if whale:
             attr = COLORS["whale"] | curses.A_BOLD
             age = (now_ns - f.egress_ns) / 1e9
-            if age <= WHALE_FLASH_S and int(age * 5) % 2 == 0:
+            if 0 <= age <= WHALE_FLASH_S and int(age * 5) % 2 == 0:
                 attr |= curses.A_REVERSE  # flashing while the whale is recent
         if breach:
             attr |= curses.A_REVERSE
@@ -1308,7 +1512,7 @@ def handle_resize(stdscr):
 BOTTOM_VIEWS = ("log", "hist", "health")
 
 
-def main(stdscr, args):
+def main(stdscr, args, stream):
     curses.curs_set(0)
     init_colors(USE_COLOR)
     stdscr.timeout(REFRESH_MS)
@@ -1319,7 +1523,7 @@ def main(stdscr, args):
     spread = SpreadTracker()
     bottom = "log"  # bottom panel on a narrow terminal: log, hist or health
 
-    worker = EngineWorker(EngineReader(make_stream(args)))
+    worker = EngineWorker(EngineReader(stream))
     worker.start()
     telemetry = Telemetry()
     telemetry.start()
@@ -1351,7 +1555,8 @@ def main(stdscr, args):
             if wins is None:
                 draw_too_small(stdscr)
             else:
-                stats_text = f"UI {fps:4.1f} fps | engine {poll_rate:,.0f} polls/s"
+                stats_text = (f"{SOURCE_LABEL} | UI {fps:4.1f} fps | "
+                              f"engine {poll_rate:,.0f} polls/s")
                 draw(wins, snap, view, stats_text, bottom,
                      spread.active(now), health)
 
@@ -1375,7 +1580,6 @@ def main(stdscr, args):
                 i = BOTTOM_VIEWS.index(bottom)
                 bottom = BOTTOM_VIEWS[(i + 1) % len(BOTTOM_VIEWS)]
             elif key in (ord("w"), ord("W")):
-                stream = worker.reader.stream
                 if hasattr(stream, "request_whale"):  # mock source only
                     stream.request_whale()
             # KEY_RESIZE is the normal signal, the size check is a safety net
@@ -1395,14 +1599,25 @@ def pct_text(value):
 if __name__ == "__main__":
     args = build_parser().parse_args()
     apply_args(args)
-    error, last, health = curses.wrapper(main, args)
+
+    try:
+        stream = make_stream(args)  # fail early, before the screen is taken over
+    except RingError as exc:
+        sys.exit(f"dashboard: {exc}")
+
+    try:
+        error, last, health = curses.wrapper(main, args, stream)
+    finally:
+        if hasattr(stream, "close"):
+            stream.close()
+
     if error:
         raise error
     if last:
         res_ns = time.get_clock_info("perf_counter").resolution * 1e9
         print(
-            f"Session ended: {last.total:,} orders processed, "
-            f"peak {last.peak:,.0f} orders/sec"
+            f"Session ended ({SOURCE_LABEL} source): {last.total:,} orders "
+            f"processed, peak {last.peak:,.0f} orders/sec"
         )
         print(
             f"Events: {last.fill_total - last.cancel_total:,} fills "
@@ -1416,11 +1631,12 @@ if __name__ == "__main__":
                 f"Process: peak memory {peak}, CPU {cpu} of one core "
                 f"(last sample), {health.threads} threads, {health.cores} cores"
             )
-        if last.ring:
-            cap, _used, ring_peak, warns, _age = last.ring
+        if last.ring and last.ring.cap:
+            ri = last.ring
             print(
-                f"Ring buffer (mock): peak {ring_peak / cap * 100:.0f}% full, "
-                f"{warns} high-watermark alerts"
+                f"Ring buffer ({SOURCE_LABEL}): peak backlog "
+                f"{ri.peak / ri.cap * 100:.0f}% of {ri.cap:,} slots, "
+                f"{ri.warns} high-watermark alerts, {ri.dropped:,} dropped events"
             )
         if last.sla_checked:
             print(
