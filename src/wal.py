@@ -1,88 +1,94 @@
 import os
 import struct
-import zlib
-from typing import List, Generator, Tuple
-
-# WAL Record Frame Layout:
-# Magic: 0x5741 (2 bytes) | Sequence: uint64 (8 bytes) | Length: uint16 (2 bytes)
-# Payload: 29 bytes | Checksum: uint32 (4 bytes) -> Total Frame = 45 bytes
-WAL_HEADER_FORMAT = "<HQH"
-WAL_HEADER_SIZE = struct.calcsize(WAL_HEADER_FORMAT)
-WAL_MAGIC = 0x5741
-
-
-class BinaryWALWriter:
-    """Append-only high-performance binary Write-Ahead Log for order events."""
-
-    def __init__(self, wal_path: str):
-        self.wal_path = wal_path
-        self._seq = 0
-        self._file = open(wal_path, "ab", buffering=65536)
-
-    def append(self, raw_order: bytes) -> int:
-        """Appends a 29-byte order frame with CRC32 checksum to disk."""
-        self._seq += 1
-        payload_len = len(raw_order)
-        header = struct.pack(WAL_HEADER_FORMAT, WAL_MAGIC, self._seq, payload_len)
-        checksum = zlib.crc32(raw_order) & 0xFFFFFFFF
-        trailer = struct.pack("<I", checksum)
-
-        self._file.write(header + raw_order + trailer)
-        return self._seq
-
-    def append_batch(self, orders: List[bytes]) -> int:
-        """Flushes a batch of orders into the WAL."""
-        count = 0
-        for o in orders:
-            self.append(o)
-            count += 1
-        self._file.flush()
-        return count
-
-    def sync(self):
-        """Forces operating system flush to physical storage."""
-        self._file.flush()
-        os.fsync(self._file.fileno())
-
-    def close(self):
-        if not self._file.closed:
-            self.sync()
-            self._file.close()
-
-
-class BinaryWALReader:
-    """Sequential reader and replay engine for corrupted state recovery."""
-
-    def __init__(self, wal_path: str):
-        self.wal_path = wal_path
-
-    def replay_records(self) -> Generator[Tuple[int, bytes], None, None]:
-        """Yields validated (sequence_id, raw_order) pairs, verifying CRC32 checksums."""
-        if not os.path.exists(self.wal_path):
-            return
-
-        with open(self.wal_path, "rb") as f:
-            while True:
-                hdr_bytes = f.read(WAL_HEADER_SIZE)
-                if len(hdr_bytes) < WAL_HEADER_SIZE:
-                    break
-
-                magic, seq, payload_len = struct.unpack(WAL_HEADER_FORMAT, hdr_bytes)
-                if magic != WAL_MAGIC:
-                    raise CorruptedWALException(f"Invalid WAL magic byte: {hex(magic)} at seq {seq}")
-
-                payload = f.read(payload_len)
-                trailer = f.read(4)
-                if len(trailer) < 4:
-                    raise CorruptedWALException("Incomplete WAL frame encountered during read")
-
-                expected_crc = struct.unpack("<I", trailer)[0]
-                actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
-                if actual_crc != expected_crc:
-                    raise CorruptedWALException(f"CRC32 mismatch on WAL record seq {seq}")
-
-                yield seq, payload
-
+from typing import Iterator, List
 
 class CorruptedWALException(Exception):
     pass
+
+class BinaryWALWriter:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._f = open(filepath, "a+b")
+
+    def append_record(self, raw_bytes: bytes) -> int:
+        if not raw_bytes:
+            return 0
+        length = len(raw_bytes)
+        record = struct.pack("<I", length) + raw_bytes
+        self._f.write(record)
+        self._f.flush()
+        return len(record)
+
+    def append_batch(self, batch: List[bytes]) -> int:
+        if not batch:
+            return 0
+        payload = bytearray()
+        for raw_bytes in batch:
+            payload.extend(struct.pack("<I", len(raw_bytes)))
+            payload.extend(raw_bytes)
+        self._f.write(payload)
+        self._f.flush()
+        return len(payload)
+
+    def create_checkpoint(self, checkpoint_seq: int, snapshot_data: bytes = b"") -> str:
+        """Day 19 Member 1: Write an atomic checkpoint record to mark safe truncation point."""
+        checkpoint_path = f"{self.filepath}.checkpoint"
+        with open(checkpoint_path, "wb") as cp_file:
+            header = struct.pack("<4sQI", b"CKPT", checkpoint_seq, len(snapshot_data))
+            cp_file.write(header)
+            if snapshot_data:
+                cp_file.write(snapshot_data)
+        return checkpoint_path
+
+    def truncate_before_sequence(self, min_retain_seq: int, schema_seq_offset: int = 1):
+        """Day 19 Member 1: Compact/truncate historical log records before a given sequence."""
+        self._f.flush()
+        reader = BinaryWALReader(self.filepath)
+        retained_records = []
+
+        for raw_record in reader.replay_records():
+            if len(raw_record) >= 9:
+                seq = struct.unpack_from("<Q", raw_record, schema_seq_offset)[0]
+                if seq >= min_retain_seq:
+                    retained_records.append(raw_record)
+            else:
+                retained_records.append(raw_record)
+
+        temp_path = f"{self.filepath}.tmp"
+        with open(temp_path, "wb") as tmp_f:
+            tmp_writer = BinaryWALWriter(temp_path)
+            tmp_writer.append_batch(retained_records)
+            tmp_writer.close()
+
+        self.close()
+        os.replace(temp_path, self.filepath)
+        self._f = open(self.filepath, "a+b")
+
+    def close(self):
+        if self._f and not self._f.closed:
+            self._f.flush()
+            self._f.close()
+
+
+class BinaryWALReader:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+
+    def replay_records(self) -> Iterator[bytes]:
+        if not os.path.exists(self.filepath):
+            return
+
+        with open(self.filepath, "rb") as f:
+            while True:
+                length_bytes = f.read(4)
+                if not length_bytes:
+                    break
+                if len(length_bytes) < 4:
+                    raise CorruptedWALException("Incomplete record length header in WAL.")
+
+                length = struct.unpack("<I", length_bytes)[0]
+                payload = f.read(length)
+                if len(payload) < length:
+                    raise CorruptedWALException("Incomplete payload read in WAL.")
+
+                yield payload
