@@ -1,246 +1,187 @@
+"""
+ChronosMatch - Day 19 Complete Integration Pipeline Runner
+Wires together:
+  - Member 1: Multi-Ring IPC Hub, Binary WAL persistence & checkpointing, IPCRecoveryManager replay
+  - Member 2: Cython OrderBook, RingConsumer zero-copy batch drain, fast-path O(1) cancel & pool recycling
+  - Member 3: MarketSimulator multi-asset batches, quote floods & flash crash cascade generation
+"""
+
 import os
 import sys
 import time
-import inspect
+import shutil
 from typing import Dict, List
 
-# Ensure local engine directory is on sys.path for C-extension resolution
-engine_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "engine"))
-if engine_path not in sys.path:
-    sys.path.insert(0, engine_path)
+engine_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "engine"))
+if engine_dir not in sys.path:
+    sys.path.insert(0, engine_dir)
 
-try:
-    from chronos_engine import OrderBook, RingConsumer
-    HAVE_CYTHON_ENGINE = True
-except ImportError:
-    HAVE_CYTHON_ENGINE = False
-    print("[WARN] chronos_engine C-extension not found or built. Falling back to EngineFeeder emulation.")
-
-from src.ring_buffer import MmapRingBuffer
+from chronos_engine import OrderBook, RingConsumer
 from src.ipc_hub import MultiRingIPCHub
+from src.ring_buffer import MmapRingBuffer
+from src.wal import BinaryWALWriter
+from src.ipc_recovery import IPCRecoveryManager
 from src.market_feed import MarketSimulator
-from src.schema import pack_order, unpack_order, pack_fill, unpack_fill, Order
-from src.wal import BinaryWALWriter, BinaryWALReader
-from src.gap_detector import SequenceGapDetector
-from src.engine_feeder import EngineFeeder
-from ui.dashboard import MultiAssetOrderBookUI
+from src.schema import pack_order
 
 
-def call_iceberg_slice(sim: MarketSimulator, symbol: str, side: bytes, total_qty: int, count: int) -> List[bytes]:
-    fn = sim.generate_iceberg_order_slice
-    params = inspect.signature(fn).parameters
-    kwargs = {}
-    if "symbol" in params:
-        kwargs["symbol"] = symbol
-    if "side" in params:
-        kwargs["side"] = side
-    if "total_quantity" in params:
-        kwargs["total_quantity"] = total_qty
-    elif "quantity" in params:
-        kwargs["quantity"] = total_qty
-    elif "total_qty" in params:
-        kwargs["total_qty"] = total_qty
-
-    if "clip_count" in params:
-        kwargs["clip_count"] = count
-    elif "num_slices" in params:
-        kwargs["num_slices"] = count
-    elif "slices" in params:
-        kwargs["slices"] = count
-    elif "count" in params:
-        kwargs["count"] = count
-
-    if kwargs:
-        return fn(**kwargs)
-    return fn(symbol, side, total_qty, count)
+def print_banner(msg: str):
+    print(f"\n{'=' * 65}\n  {msg}\n{'=' * 65}")
 
 
-def main():
-    print("=" * 70)
-    print("  CHRONOS MATCH MASTER PIPELINE EXECUTION (DAY 1 - DAY 17)")
-    print("=" * 70)
+def run_pipeline(symbols: List[str] = None, cycles: int = 5):
+    symbols = symbols or ["AAPL", "MSFT", "TSLA"]
+    base_ipc_dir = os.path.abspath("runtime_ipc")
+    wal_dir = os.path.abspath("runtime_wal")
 
-    symbols = ["AAPL", "MSFT", "TSLA"]
-    base_ipc_dir = "data/chronos_ipc_runtime"
-    wal_file = "data/audit_day17.wal"
-    os.makedirs(base_ipc_dir, exist_ok=True)
-    os.makedirs("data", exist_ok=True)
+    for d in (base_ipc_dir, wal_dir):
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
 
-    # 1. Initialize Multi-Ring IPC Hub (Days 1-8)
-    print("[1/7] Initializing MultiRingIPCHub and WAL Writer...")
+    print_banner("CHRONOSMATCH PIPELINE INTEGRATION (THROUGH DAY 19)")
+    print(f"[*] Active Assets   : {', '.join(symbols)}")
+    print(f"[*] IPC Directory   : {base_ipc_dir}")
+    print(f"[*] WAL Directory   : {wal_dir}")
+
     hub = MultiRingIPCHub(
         symbols=symbols,
         base_dir=base_ipc_dir,
-        capacity_per_ring=256,
-        create=True,
-        high_watermark=0.85
+        capacity_per_ring=1024,
+        create=True
     )
-    wal_writer = BinaryWALWriter(wal_file)
 
-    # 2. Initialize Outbound Fill Rings (Day 16 / Day 13 contract)
-    for sym in symbols:
-        hub.init_execution_ring(sym, capacity=256)
-
-    # 3. Engine & Consumer Setup (Day 9, Day 12)
-    order_books = {}
-    ring_consumers = {}
-    if HAVE_CYTHON_ENGINE:
-        print("[2/7] Binding Cython OrderBooks with Preallocated Memory Pools...")
-        for sym in symbols:
-            order_books[sym] = OrderBook(order_capacity=10000, level_capacity=500)
-            ring_consumers[sym] = RingConsumer(hub.ring_buffers[sym].filepath, hub.locks[sym].filepath)
-    else:
-        print("[2/7] Initializing Python EngineFeeders...")
-
-    # 4. Gap Detectors and Multi-Asset UI (Day 17)
-    gap_detectors = {sym: SequenceGapDetector(expected_start_seq=1) for sym in symbols}
+    books: Dict[str, OrderBook] = {}
+    consumers: Dict[str, RingConsumer] = {}
+    wal_writers: Dict[str, BinaryWALWriter] = {}
+    outbound_fill_rings: Dict[str, MmapRingBuffer] = {}
     sim = MarketSimulator(symbols=symbols)
-    ui = MultiAssetOrderBookUI(symbols=symbols)
 
-    total_orders_ingested = 0
-    total_fills_logged = 0
+    total_orders_generated = 0
+    total_matches_executed = 0
 
     try:
-        # -------------------------------------------------------------
-        # STAGE 1: Correlated Flow & Gap Detection (Days 1-13)
-        # -------------------------------------------------------------
-        print("\n[Stage 1] Ingesting Correlated Multi-Asset Flow & Gap Verification...")
-        batch_1 = sim.generate_correlated_multi_asset_batch(batch_size_per_symbol=25)
-        for sym, pkts in batch_1.items():
-            wal_writer.append_batch(pkts)
-            hub.write_symbol_batch_with_backpressure(sym, pkts)
-
+        # 1. Initialize per-symbol engines, rings, consumers, and loggers
         for sym in symbols:
-            if HAVE_CYTHON_ENGINE:
-                summary = ring_consumers[sym].drain_into(order_books[sym])
-                total_orders_ingested += summary["messages"]
-            else:
-                pkts = hub.ring_buffers[sym].read_batch(max_count=100, lock=hub.locks[sym])
-                total_orders_ingested += len(pkts)
-        print(f"  -> Dispatched {total_orders_ingested} correlated orders.")
-
-        # -------------------------------------------------------------
-        # STAGE 2: Iceberg Slicing & Zero-Copy Compaction (Day 14)
-        # -------------------------------------------------------------
-        print("\n[Stage 2] Running Iceberg Slicing & Ring Compaction (Day 14)...")
-        for sym in symbols:
-            slices = call_iceberg_slice(sim, sym, b"B", 600, 6)
-            hub.write_symbol_batch(sym, slices)
-            wal_writer.append_batch(slices)
-
-            unconsumed = hub.ring_buffers[sym].compact_ring_buffer(hub.locks[sym])
-            print(f"  -> Compacted ring for {sym}. Unconsumed slots: {unconsumed}")
-
-            if HAVE_CYTHON_ENGINE:
-                summary = ring_consumers[sym].drain_into(order_books[sym])
-                total_orders_ingested += summary["messages"]
-            else:
-                pkts = hub.ring_buffers[sym].read_batch(max_count=50, lock=hub.locks[sym])
-                total_orders_ingested += len(pkts)
-
-        # -------------------------------------------------------------
-        # STAGE 3: Dynamic In-Memory Ring Resizing (Day 15)
-        # -------------------------------------------------------------
-        print("\n[Stage 3] Dynamic In-Memory Buffer Resizing to 512 Slots (Day 15)...")
-        for sym in symbols:
-            success = hub.ring_buffers[sym].resize_ring_buffer(512, hub.locks[sym])
-            assert success is True
-            print(f"  -> Resized {sym} ring buffer capacity to: {hub.ring_buffers[sym].capacity}")
-
-        # -------------------------------------------------------------
-        # STAGE 4: Microstructural Order Book Imbalance (OBI) Flow (Day 15)
-        # -------------------------------------------------------------
-        print("\n[Stage 4] Generating Microstructural OBI Pressure Flow (Day 15)...")
-        obi_pkts = sim.generate_book_imbalance_pressure("AAPL", target_imbalance=0.80, batch_size=30)
-        hub.write_symbol_batch("AAPL", obi_pkts)
-        wal_writer.append_batch(obi_pkts)
-
-        if HAVE_CYTHON_ENGINE:
-            summary_aapl = ring_consumers["AAPL"].drain_into(order_books["AAPL"])
-            total_orders_ingested += summary_aapl["messages"]
-        else:
-            pkts = hub.ring_buffers["AAPL"].read_batch(max_count=50, lock=hub.locks["AAPL"])
-            total_orders_ingested += len(pkts)
-
-        # -------------------------------------------------------------
-        # STAGE 5: Informed Toxic Flow Sweep (Day 16)
-        # -------------------------------------------------------------
-        print("\n[Stage 5] Injecting Informed Toxic Flow Sweeps (Day 16)...")
-        toxic_orders, new_price = sim.generate_toxic_flow("MSFT", sweep_depth=10, price_jump=2.0)
-        hub.write_symbol_batch("MSFT", toxic_orders)
-        wal_writer.append_batch(toxic_orders)
-        print(f"  -> MSFT Midpoint shifted to ${new_price:.2f}")
-
-        if HAVE_CYTHON_ENGINE:
-            summary_msft = ring_consumers["MSFT"].drain_into(order_books["MSFT"])
-            total_orders_ingested += summary_msft["messages"]
-        else:
-            pkts = hub.ring_buffers["MSFT"].read_batch(max_count=50, lock=hub.locks["MSFT"])
-            total_orders_ingested += len(pkts)
-
-        # -------------------------------------------------------------
-        # STAGE 6: Spoofing & Layering Microstructural Attack (Day 17)
-        # -------------------------------------------------------------
-        print("\n[Stage 6] Simulating Spoofing & Layering Microstructural Attack (Day 17)...")
-        fake_bids, real_sell, cancels = sim.generate_spoofing_attack("TSLA", fake_layers=5, fake_qty_per_layer=500)
-        attack_stream = fake_bids + [real_sell] + cancels
-        hub.write_symbol_batch("TSLA", attack_stream)
-        wal_writer.append_batch(attack_stream)
-
-        if HAVE_CYTHON_ENGINE:
-            summary_tsla = ring_consumers["TSLA"].drain_into(order_books["TSLA"])
-            total_orders_ingested += summary_tsla["messages"]
-        else:
-            pkts = hub.ring_buffers["TSLA"].read_batch(max_count=50, lock=hub.locks["TSLA"])
-            total_orders_ingested += len(pkts)
-
-        # Emit simulated fills on execution ring
-        now_ns = time.perf_counter_ns()
-        for idx in range(1, 11):
-            fill = pack_fill(
-                order_id=1000 + idx,
-                fill_id=idx,
-                side=b"B" if idx % 2 == 0 else b"S",
-                price=150.0 + (idx * 0.25),
-                quantity=100,
-                timestamp_ns=now_ns,
+            books[sym] = OrderBook(order_capacity=20000, level_capacity=500)
+            consumers[sym] = RingConsumer(
+                hub.ring_buffers[sym].filepath,
+                hub.locks[sym].filepath
             )
-            hub.write_fill("AAPL", fill)
-            total_fills_logged += 1
+            wal_writers[sym] = BinaryWALWriter(os.path.join(wal_dir, f"{sym}.wal"))
 
-        wal_writer.close()
+            fill_ring_path = os.path.join(base_ipc_dir, f"fills_{sym}.bin")
+            outbound_fill_rings[sym] = MmapRingBuffer(
+                fill_ring_path,
+                capacity=1024,
+                slot_size=53,
+                create=True
+            )
 
-        # -------------------------------------------------------------
-        # STAGE 7: Audit Verification & UI Refresh
-        # -------------------------------------------------------------
-        print("\n[Stage 7] Performing Binary WAL Replay Audit & UI Refresh...")
-        wal_reader = BinaryWALReader(wal_file)
-        wal_records = list(wal_reader.replay_records())
+        print("\n[>>>] Commencing Live Ingestion & Matching Cycles...")
+
+        # 2. Normal Ingestion & Matching Cycles
+        for cycle in range(1, cycles + 1):
+            print(f"\n--- [Cycle {cycle}/{cycles}] ---")
+
+            feed_batch = sim.generate_correlated_multi_asset_batch(batch_size_per_symbol=15)
+
+            for sym in symbols:
+                pkts = feed_batch.get(sym, [])
+                total_orders_generated += len(pkts)
+
+                wal_writers[sym].append_batch(pkts)
+                hub.write_symbol_batch(sym, pkts)
+
+                drain_stat = consumers[sym].drain_into(books[sym])
+                total_matches_executed += drain_stat.get("trades", 0)
+
+                best_bid = books[sym].best_bid()
+                best_ask = books[sym].best_ask()
+                bid_px = best_bid[0] if isinstance(best_bid, tuple) else best_bid
+                ask_px = best_ask[0] if isinstance(best_ask, tuple) else best_ask
+                stats = books[sym].pool_stats()["orders"]
+
+                print(
+                    f"  [{sym}] Ingested: {drain_stat['messages']:2d} | "
+                    f"Bid: {str(bid_px):>7} | Ask: {str(ask_px):>7} | "
+                    f"Pool In-Use: {stats['in_use']:3d}/{stats['capacity']}"
+                )
+
+            # Day 19: Checkpoint WAL at Cycle 3
+            if cycle == 3:
+                for sym in symbols:
+                    wal_writers[sym].create_checkpoint(checkpoint_seq=total_orders_generated)
+                print("  [CKPT] Binary WAL checkpoints created across all assets.")
+
+            # Fast-Path O(1) Cancellation verification
+            if cycle % 2 == 0:
+                cancel_sym = symbols[0]
+                test_cancel_id = 999000 + cycle
+                cancel_pkt = pack_order(test_cancel_id, b"B", 100.0, 50, time.time_ns())
+                hub.write_symbol_batch(cancel_sym, [cancel_pkt])
+                consumers[cancel_sym].drain_into(books[cancel_sym])
+
+                ok = books[cancel_sym].cancel(test_cancel_id)
+                print(f"  [CAN] Direct Cancel order_id={test_cancel_id} on {cancel_sym}: {'SUCCESS' if ok else 'FAILED'}")
+
+            time.sleep(0.05)
+
+        # 3. Day 19 Member 3: Inject Flash Crash Cascade on TSLA
+        print_banner("DAY 19 STRESS TEST: INJECTING FLASH CRASH CASCADE")
+        crash_sym = "TSLA"
+        pre_crash_px = sim.asset_prices[crash_sym]
+        sells, bids, crashed_px = sim.generate_flash_crash_cascade(crash_sym, crash_depth_pct=0.08)
+        print(f"[*] Triggered flash crash on {crash_sym}: ${pre_crash_px:.2f} -> ${crashed_px:.2f}")
+
+        crash_stream = sells + bids
+        wal_writers[crash_sym].append_batch(crash_stream)
+        hub.write_symbol_batch(crash_sym, crash_stream)
+        total_orders_generated += len(crash_stream)
+
+        drain_crash = consumers[crash_sym].drain_into(books[crash_sym])
+        print(f"[*] Ingested {drain_crash['messages']} flash crash orders into {crash_sym} OrderBook.")
+
+        # 4. Day 19 Member 1: Verify IPC Recovery Replay
+        print_banner("DAY 19 DURABILITY: IPC RECOVERY MANAGER REPLAY")
+        wal_file = os.path.join(wal_dir, f"{crash_sym}.wal")
+        recovery_mgr = IPCRecoveryManager(wal_file)
+        ckpt_seq, _ = recovery_mgr.read_last_checkpoint()
+        recovered = recovery_mgr.recover_unprocessed_orders(symbol=crash_sym, last_processed_seq=ckpt_seq)
+        recovered_count = len(recovered.get(crash_sym, []))
+        print(f"[*] Last Checkpoint Sequence: {ckpt_seq}")
+        print(f"[*] Recovered Unprocessed Orders from WAL: {recovered_count} orders for {crash_sym}")
+        assert recovered_count > 0, "Recovery Manager failed to replay post-checkpoint orders!"
+
+        # 5. Telemetry & Summary
+        print_banner("PIPELINE EXECUTION SUMMARY")
+        print(f"Total Orders Ingested      : {total_orders_generated}")
+        print(f"Total Matches Executed     : {total_matches_executed}")
 
         for sym in symbols:
-            drained_fills = hub.read_fills(sym, max_count=50)
-            if drained_fills:
-                print(f"  -> Outbound fills drained for {sym}: {len(drained_fills)}")
+            pool = books[sym].pool_stats()
+            orders_info = pool.get("orders", {})
+            levels_info = pool.get("levels", {})
+            in_use = orders_info.get("in_use", 0)
+            cap = orders_info.get("capacity", 20000)
+            lvl_in_use = levels_info.get("in_use", 0)
+            print(
+                f"[{sym}] Orders In-Use: {in_use:4d} / {cap:5d} | "
+                f"Levels In-Use: {lvl_in_use:3d}"
+            )
 
-        if HAVE_CYTHON_ENGINE:
-            for sym in symbols:
-                stats = order_books[sym].pool_stats()
-                orders_stat = stats.get("orders", {})
-                levels_stat = stats.get("levels", {})
-                print(
-                    f"  -> Cython Pool Stats [{sym}]: "
-                    f"Orders In-Use={orders_stat.get('in_use', 0)}/{orders_stat.get('capacity', 0)} (Peak={orders_stat.get('peak', 0)}) | "
-                    f"Levels In-Use={levels_stat.get('in_use', 0)}/{levels_stat.get('capacity', 0)} (Peak={levels_stat.get('peak', 0)})"
-                )
+        print("\n[OK] Pipeline integration run through Day 19 completed successfully!")
+
     finally:
+        print("\n[*] Tearing down IPC buffers and file handles...")
         hub.close()
+        for sym in symbols:
+            outbound_fill_rings[sym].close()
+            wal_writers[sym].close()
         hub.cleanup_files()
-        if os.path.exists(wal_file):
-            try:
-                os.remove(wal_file)
-            except OSError:
-                pass
+        shutil.rmtree(base_ipc_dir, ignore_errors=True)
+        shutil.rmtree(wal_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    main()
+    run_pipeline()
