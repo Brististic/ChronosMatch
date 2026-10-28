@@ -12,3 +12,6 @@ dist/
 .vscode/
 *.mmap
 data/
+
+runtime_ipc/
+runtime_wal/
