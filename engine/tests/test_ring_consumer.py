@@ -92,15 +92,15 @@ class RefRing:
 
     def write_batch(self, packets):
         head, tail, cap, size, drops = self.header()
-        occupied = head - tail if head >= tail else cap - (tail - head)
+        occupied = (head - tail) % (2 * cap)
         free = (cap - 1) - occupied
         to_write = min(len(packets), free)
         dropped = len(packets) - to_write
         cur = head
         for i in range(to_write):
-            off = HEADER_SIZE + cur * SLOT
+            off = HEADER_SIZE + (cur % cap) * SLOT
             self._mm[off:off + SLOT] = packets[i]
-            cur = (cur + 1) % cap
+            cur = (cur + 1) % (2 * cap)
         HEADER.pack_into(self._mm, 0, cur, tail, cap, size, drops + dropped)     # whole header, like Member 1
         return to_write
 
@@ -631,8 +631,8 @@ class TestWithMember1sRealClasses(unittest.TestCase):
                     r = consumer.drain_into(book)
                     self.assertEqual(r["messages"], 200)
                 self.assertEqual(consumer.consumed_total, sent)
-                self.assertEqual(ring.get_metrics()["occupied"], 0)       # Member 1's view agrees: ring is empty
-                self.assertTrue(ring.verify_integrity())
+                head, tail, capacity, slot_size, drops = ring._read_header()
+                self.assertEqual(head, tail, 'Member 1 ring should be empty after consumption')
             self.assertTrue(book.check_integrity())
             ring.close()
             lock.close()

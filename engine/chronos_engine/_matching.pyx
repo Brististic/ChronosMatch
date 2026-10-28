@@ -1079,17 +1079,17 @@ cdef int _ring_take(const unsigned char* ring, uint32_t capacity, unsigned char*
     taken[0] = 0
     left[0] = 0
     memcpy(drops, ring + RING_OFF_DROPS, sizeof(unsigned long long))
-    if head >= capacity or tail >= capacity:
+    if head >= 2 * capacity or tail >= 2 * capacity:
         return 1
-    available = head - tail if head >= tail else capacity - (tail - head)
+    available = (head - tail) % capacity
     n = available if available < limit else limit
     if n == 0:
         return 0
-    first = n if n < capacity - tail else capacity - tail            # slots before the wrap-around
-    memcpy(staging, ring + RING_HEADER_SIZE + <size_t> tail * slot, <size_t> first * slot)
+    first = n if n < capacity - (tail % capacity) else capacity - (tail % capacity)  # slots before the wrap-around
+    memcpy(staging, ring + RING_HEADER_SIZE + <size_t> (tail % capacity) * slot, <size_t> first * slot)
     if n > first:
         memcpy(staging + <size_t> first * slot, ring + RING_HEADER_SIZE, <size_t> (n - first) * slot)
-    cm_store_release(<unsigned char*> ring + RING_OFF_TAIL, (tail + n) % capacity)   # release: consumed before slot is freed
+    cm_store_release(<unsigned char*> ring + RING_OFF_TAIL, (tail + n) % (2 * capacity))  # release: consumed before slot is freed
     taken[0] = n
     left[0] = available - n
     return 0
@@ -1274,9 +1274,9 @@ cdef class RingConsumer:
         self._check_open()
         head = cm_load_acquire(self._ring + RING_OFF_HEAD)
         tail = cm_load_acquire(self._ring + RING_OFF_TAIL)
-        if head >= self._capacity or tail >= self._capacity:
+        if head >= 2 * self._capacity or tail >= 2 * self._capacity:
             raise ValueError("ring header is corrupt (head/tail outside the capacity)")
-        return head - tail if head >= tail else self._capacity - (tail - head)
+        return (head - tail) % self._capacity
 
     def producer_drops(self):
         """Overrun counter kept by the producer: messages it had to drop because the ring was full."""
@@ -1337,7 +1337,7 @@ cdef class RingConsumer:
         fillbuf_clear(fills)                                # fills of the PREVIOUS drain must never be reported again
         head = cm_load_acquire(ring + RING_OFF_HEAD)
         tail = cm_load_acquire(ring + RING_OFF_TAIL)
-        if head == tail and head < capacity:
+        if head == tail and head < 2 * capacity:
             memcpy(&st.drops, ring + RING_OFF_DROPS, sizeof(unsigned long long))
             return 0
         if track:
