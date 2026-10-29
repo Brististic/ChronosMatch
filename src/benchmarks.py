@@ -1,85 +1,54 @@
-import math
-import os
 import time
-from typing import Dict, List
+import statistics
+from typing import List, Dict, Any
+from src.schema import pack_order
 from src.ring_buffer import MmapRingBuffer
 from src.ipc_sync import MmapProcessLock
-from src.schema import pack_order, unpack_order
 
+class IPCLatencyBenchmark:
+    """Day 20 Member 1: High-resolution latency profiler and throughput measurement harness."""
 
-def calculate_percentiles(latencies_us: List[float]) -> Dict[str, float]:
-    """Calculates summary percentiles (p50, p90, p99, p99.9, max, avg) for latency arrays."""
-    if not latencies_us:
-        return {"avg": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0, "p99_9": 0.0, "max": 0.0, "min": 0.0}
+    def __init__(self, ring: MmapRingBuffer, lock: MmapProcessLock):
+        self.ring = ring
+        self.lock = lock
 
-    sorted_vals = sorted(latencies_us)
-    n = len(sorted_vals)
+    def measure_round_trip_latencies(self, num_orders: int = 1000) -> Dict[str, Any]:
+        """Measures write-to-read transit latency in nanoseconds using hardware-level timestamps."""
+        latencies_ns: List[int] = []
 
-    def pct(p: float) -> float:
-        k = (n - 1) * (p / 100.0)
-        f = math.floor(k)
-        c = math.ceil(k)
-        if f == c:
-            return round(sorted_vals[int(k)], 3)
-        d0 = sorted_vals[int(f)] * (c - k)
-        d1 = sorted_vals[int(c)] * (k - f)
-        return round(d0 + d1, 3)
+        for i in range(num_orders):
+            t_write_ns = time.perf_counter_ns()
+            pkt = pack_order(
+                order_id=i + 1,
+                side=b"B" if i % 2 == 0 else b"S",
+                price=100.0 + (i % 10) * 0.1,
+                quantity=100,
+                timestamp_ns=t_write_ns
+            )
 
-    return {
-        "avg": round(sum(sorted_vals) / n, 3),
-        "min": round(sorted_vals[0], 3),
-        "p50": pct(50.0),
-        "p90": pct(90.0),
-        "p99": pct(99.0),
-        "p99_9": pct(99.9),
-        "max": round(sorted_vals[-1], 3),
-    }
+            with self.lock:
+                self.ring.write_batch([pkt])
 
+            with self.lock:
+                # Positional call: avoids keyword name mismatch (max_count vs batch_size)
+                packets = self.ring.read_batch(1)
 
-def benchmark_ring_buffer_throughput(
-    buffer_path: str,
-    lock_path: str,
-    total_orders: int = 50_000,
-    batch_size: int = 64,
-) -> Dict[str, float]:
-    """Benchmarks direct zero-copy write_batch and read_batch throughput under spinlock."""
-    rb = MmapRingBuffer(buffer_path, capacity=4096, create=True)
-    lock = MmapProcessLock(lock_path, create=True)
+            t_read_ns = time.perf_counter_ns()
+            if packets:
+                latencies_ns.append(max(0, t_read_ns - t_write_ns))
 
-    dummy_packets = [
-        pack_order(i, b"B", 150.0 + (i % 10), 100, time.perf_counter_ns())
-        for i in range(total_orders)
-    ]
+        if not latencies_ns:
+            return {"count": 0, "p50_us": 0.0, "p99_us": 0.0, "p999_us": 0.0, "mean_us": 0.0}
 
-    # Write benchmark
-    t0 = time.perf_counter()
-    written = 0
-    for i in range(0, total_orders, batch_size):
-        batch = dummy_packets[i : i + batch_size]
-        with lock:
-            written += rb.write_batch(batch)
-    write_time = time.perf_counter() - t0
-    write_throughput = written / write_time if write_time > 0 else 0.0
-
-    # Read benchmark
-    t1 = time.perf_counter()
-    read_count = 0
-    while read_count < written:
-        with lock:
-            batch = rb.read_batch(max_count=batch_size)
-        if not batch:
-            break
-        read_count += len(batch)
-    read_time = time.perf_counter() - t1
-    read_throughput = read_count / read_time if read_time > 0 else 0.0
-
-    rb.close()
-    lock.close()
-
-    return {
-        "total_orders": written,
-        "write_throughput_ops_sec": round(write_throughput, 1),
-        "read_throughput_ops_sec": round(read_throughput, 1),
-        "write_time_sec": round(write_time, 4),
-        "read_time_sec": round(read_time, 4),
-    }
+        latencies_ns.sort()
+        n = len(latencies_ns)
+        return {
+            "count": n,
+            "mean_us": round(statistics.mean(latencies_ns) / 1000.0, 3),
+            "p50_us": round(latencies_ns[int(n * 0.50)] / 1000.0, 3),
+            "p90_us": round(latencies_ns[int(n * 0.90)] / 1000.0, 3),
+            "p99_us": round(latencies_ns[min(n - 1, int(n * 0.99))] / 1000.0, 3),
+            "p999_us": round(latencies_ns[min(n - 1, int(n * 0.999))] / 1000.0, 3),
+            "min_us": round(latencies_ns[0] / 1000.0, 3),
+            "max_us": round(latencies_ns[-1] / 1000.0, 3),
+        }

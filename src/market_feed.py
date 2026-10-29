@@ -346,3 +346,33 @@ class MarketSimulator:
                 )
             )
         return packets
+
+    def generate_systemic_crisis_burst(
+        self,
+        volatility_multiplier: float = 2.5,
+        orders_per_symbol: int = 50
+    ) -> dict[str, list[bytes]]:
+        """Day 20 Member 3: Multi-asset cross-market synchronized liquidity collapse simulation."""
+        crisis_batches: dict[str, list[bytes]] = {}
+        for sym in self.symbols:
+            base_px = self.asset_prices.get(sym, 100.0)
+            pkts = []
+            for i in range(orders_per_symbol):
+                # Spread blowout and directional panic bias
+                is_panic_sell = (i % 3 != 0)
+                spread_widen = (i % 10 + 1) * 0.25 * volatility_multiplier
+                px = round(base_px - spread_widen if is_panic_sell else base_px + spread_widen, 2)
+                qty = (i % 5 + 1) * 200
+
+                pkts.append(
+                    pack_order(
+                        order_id=self._get_next_id(),
+                        side=b"S" if is_panic_sell else b"B",
+                        price=max(1.0, px),
+                        quantity=qty,
+                        timestamp_ns=time.time_ns()
+                    )
+                )
+            self.asset_prices[sym] = round(base_px * (0.95 if sym == "TSLA" else 0.97), 2)
+            crisis_batches[sym] = pkts
+        return crisis_batches
