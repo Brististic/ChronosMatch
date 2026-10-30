@@ -376,3 +376,26 @@ class MarketSimulator:
             self.asset_prices[sym] = round(base_px * (0.95 if sym == "TSLA" else 0.97), 2)
             crisis_batches[sym] = pkts
         return crisis_batches
+
+    def run_producer_stream(
+        self,
+        hub_base_dir: str,
+        cycles: int = 10,
+        batch_size: int = 10,
+        delay_s: float = 0.02
+    ) -> int:
+        """Day 21 Member 3: Standalone streaming loop designed to run in an isolated OS process."""
+        from src.ipc_hub import MultiRingIPCHub
+        hub = MultiRingIPCHub(symbols=self.symbols, base_dir=hub_base_dir, create=False)
+        total_produced = 0
+        try:
+            for _ in range(cycles):
+                batch = self.generate_correlated_multi_asset_batch(batch_size_per_symbol=batch_size)
+                for sym, pkts in batch.items():
+                    if pkts:
+                        hub.write_symbol_batch(sym, pkts)
+                        total_produced += len(pkts)
+                time.sleep(delay_s)
+        finally:
+            hub.close()
+        return total_produced

@@ -1,9 +1,13 @@
+﻿# -*- coding: utf-8 -*-
 """
-ChronosMatch - Day 19 Complete Integration Pipeline Runner
+ChronosMatch - Day 20 Complete Integration Pipeline Runner
 Wires together:
-  - Member 1: Multi-Ring IPC Hub, Binary WAL persistence & checkpointing, IPCRecoveryManager replay
-  - Member 2: Cython OrderBook, RingConsumer zero-copy batch drain, fast-path O(1) cancel & pool recycling
-  - Member 3: MarketSimulator multi-asset batches, quote floods & flash crash cascade generation
+  - Member 1: Multi-Ring IPC Hub, Binary WAL persistence & checkpointing,
+              IPCRecoveryManager replay, IPCLatencyBenchmark profiling
+  - Member 2: Cython OrderBook, RingConsumer zero-copy batch drain,
+              fast-path O(1) cancel & pool recycling
+  - Member 3: MarketSimulator multi-asset batches, quote floods,
+              flash crash cascades, and systemic crisis bursts
 """
 
 import os
@@ -19,10 +23,12 @@ if engine_dir not in sys.path:
 from chronos_engine import OrderBook, RingConsumer
 from src.ipc_hub import MultiRingIPCHub
 from src.ring_buffer import MmapRingBuffer
+from src.ipc_sync import MmapProcessLock
 from src.wal import BinaryWALWriter
 from src.ipc_recovery import IPCRecoveryManager
+from src.benchmarks import IPCLatencyBenchmark
 from src.market_feed import MarketSimulator
-from src.schema import pack_order
+from src.schema import pack_order, ORDER_STRUCT_SIZE
 
 
 def print_banner(msg: str):
@@ -39,10 +45,11 @@ def run_pipeline(symbols: List[str] = None, cycles: int = 5):
             shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
 
-    print_banner("CHRONOSMATCH PIPELINE INTEGRATION (THROUGH DAY 19)")
+    print_banner("CHRONOSMATCH PIPELINE INTEGRATION (THROUGH DAY 20)")
     print(f"[*] Active Assets   : {', '.join(symbols)}")
     print(f"[*] IPC Directory   : {base_ipc_dir}")
     print(f"[*] WAL Directory   : {wal_dir}")
+    print(f"[*] Wire Packet Size: {ORDER_STRUCT_SIZE} bytes")
 
     hub = MultiRingIPCHub(
         symbols=symbols,
@@ -80,7 +87,7 @@ def run_pipeline(symbols: List[str] = None, cycles: int = 5):
 
         print("\n[>>>] Commencing Live Ingestion & Matching Cycles...")
 
-        # 2. Normal Ingestion & Matching Cycles
+        # 2. Ingestion & Matching Cycles (Days 1 to 18 baseline)
         for cycle in range(1, cycles + 1):
             print(f"\n--- [Cycle {cycle}/{cycles}] ---")
 
@@ -127,8 +134,8 @@ def run_pipeline(symbols: List[str] = None, cycles: int = 5):
 
             time.sleep(0.05)
 
-        # 3. Day 19 Member 3: Inject Flash Crash Cascade on TSLA
-        print_banner("DAY 19 STRESS TEST: INJECTING FLASH CRASH CASCADE")
+        # 3. Day 19 Member 3: Inject Flash Crash Cascade
+        print_banner("DAY 19 STRESS TEST: FLASH CRASH CASCADE")
         crash_sym = "TSLA"
         pre_crash_px = sim.asset_prices[crash_sym]
         sells, bids, crashed_px = sim.generate_flash_crash_cascade(crash_sym, crash_depth_pct=0.08)
@@ -138,7 +145,6 @@ def run_pipeline(symbols: List[str] = None, cycles: int = 5):
         wal_writers[crash_sym].append_batch(crash_stream)
         hub.write_symbol_batch(crash_sym, crash_stream)
         total_orders_generated += len(crash_stream)
-
         drain_crash = consumers[crash_sym].drain_into(books[crash_sym])
         print(f"[*] Ingested {drain_crash['messages']} flash crash orders into {crash_sym} OrderBook.")
 
@@ -149,11 +155,42 @@ def run_pipeline(symbols: List[str] = None, cycles: int = 5):
         ckpt_seq, _ = recovery_mgr.read_last_checkpoint()
         recovered = recovery_mgr.recover_unprocessed_orders(symbol=crash_sym, last_processed_seq=ckpt_seq)
         recovered_count = len(recovered.get(crash_sym, []))
-        print(f"[*] Last Checkpoint Sequence: {ckpt_seq}")
-        print(f"[*] Recovered Unprocessed Orders from WAL: {recovered_count} orders for {crash_sym}")
+        print(f"[*] Last Checkpoint: {ckpt_seq} | Replayed post-checkpoint orders: {recovered_count}")
         assert recovered_count > 0, "Recovery Manager failed to replay post-checkpoint orders!"
 
-        # 5. Telemetry & Summary
+        # 5. Day 20 Member 3: Systemic Crisis Burst (Cross-Asset Liquidity Shock)
+        print_banner("DAY 20 STRESS TEST: SYSTEMIC CRISIS BURST (CROSS-ASSET)")
+        crisis_data = sim.generate_systemic_crisis_burst(volatility_multiplier=2.5, orders_per_symbol=30)
+        for sym, crisis_pkts in crisis_data.items():
+            wal_writers[sym].append_batch(crisis_pkts)
+            hub.write_symbol_batch(sym, crisis_pkts)
+            total_orders_generated += len(crisis_pkts)
+            d_stat = consumers[sym].drain_into(books[sym])
+            print(f"  [{sym}] Ingested {d_stat['messages']} crisis panic orders | Updated Price: ${sim.asset_prices[sym]:.2f}")
+
+        # 6. Day 20 Member 1: IPC Sub-Microsecond Transit Latency Benchmark
+        print_banner("DAY 20 BENCHMARK: IPC WIRE TRANSIT LATENCY PROFILER")
+        bench_ring_path = os.path.join(base_ipc_dir, "bench_ring.bin")
+        bench_lock_path = os.path.join(base_ipc_dir, "bench_lock.bin")
+        bench_ring = MmapRingBuffer(bench_ring_path, capacity=512, slot_size=ORDER_STRUCT_SIZE, create=True)
+        bench_lock = MmapProcessLock(bench_lock_path, create=True)
+
+        try:
+            bench = IPCLatencyBenchmark(bench_ring, bench_lock)
+            stats = bench.measure_round_trip_latencies(num_orders=500)
+            print(f"[*] Benchmark Samples : {stats['count']}")
+            print(f"[*] Mean Latency      : {stats['mean_us']} us")
+            print(f"[*] p50 Latency       : {stats['p50_us']} us")
+            print(f"[*] p90 Latency       : {stats['p90_us']} us")
+            print(f"[*] p99 Latency       : {stats['p99_us']} us")
+            print(f"[*] p99.9 Latency     : {stats['p999_us']} us")
+            print(f"[*] Min / Max Latency : {stats['min_us']} us / {stats['max_us']} us")
+            assert stats["count"] == 500, "Benchmark failed to process 500 round-trip samples!"
+        finally:
+            bench_ring.close()
+            bench_lock.close()
+
+        # 7. Final Pipeline Telemetry Summary
         print_banner("PIPELINE EXECUTION SUMMARY")
         print(f"Total Orders Ingested      : {total_orders_generated}")
         print(f"Total Matches Executed     : {total_matches_executed}")
@@ -170,7 +207,7 @@ def run_pipeline(symbols: List[str] = None, cycles: int = 5):
                 f"Levels In-Use: {lvl_in_use:3d}"
             )
 
-        print("\n[OK] Pipeline integration run through Day 19 completed successfully!")
+        print("\n[OK] Pipeline integration run through Day 20 completed successfully!")
 
     finally:
         print("\n[*] Tearing down IPC buffers and file handles...")

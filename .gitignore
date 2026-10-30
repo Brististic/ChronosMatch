@@ -1,17 +1,29 @@
+﻿# Byte-compiled / optimized / cache files
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Cython build artifacts
 *.c
-*.html
+*.pyd
+*.so
 build/
 dist/
 *.egg-info/
-.pytest_cache/
-.vscode/
-*.mmap
-data/
 
+# ChronosMatch runtime IPC and WAL files
 runtime_ipc/
 runtime_wal/
+*.bin
+*.wal
+*.lock
+
+# OS & IDE artifacts
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.swp
