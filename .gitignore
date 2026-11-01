@@ -8,13 +8,17 @@ htmlcov/
 
 # Cython build artifacts
 *.c
+*.cpp
 *.pyd
 *.so
 build/
 dist/
 *.egg-info/
+*.zip
 
-# ChronosMatch runtime IPC and WAL files
+# Runtime IPC and WAL files
+demo_ipc_runtime/
+chronos_ipc_runtime/
 runtime_ipc/
 runtime_wal/
 *.bin
