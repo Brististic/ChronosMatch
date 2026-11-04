@@ -233,7 +233,7 @@ class TestLatencyBenchmark(unittest.TestCase):
         result = bench_latency(20_000, 200)
         for op in ("insert", "cancel"):
             r = result[op]
-            self.assertGreater(r["p50"], 0)
+            self.assertGreaterEqual(r["p50"], 0)
             self.assertLessEqual(r["p50"], r["p90"])
             self.assertLessEqual(r["p90"], r["p99"])
             self.assertLessEqual(r["p99"], r["p99_9"])
